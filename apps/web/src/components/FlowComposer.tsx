@@ -8,7 +8,7 @@ import type { Contact } from "@/components/ContactsTable";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-const sources = ["Gmail", "Slack", "GitHub", "Google Calendar", "Vercel", "PostgreSQL"];
+const sources = ["Gmail", "Notion", "Slack", "GitHub", "Google Calendar", "Vercel", "PostgreSQL"];
 const examples = [
   "Call me when @Aarav emails me on Gmail",
   "Call me when production goes down",
@@ -20,6 +20,7 @@ export type Task = {
   id: string;
   originalPrompt: string;
   gmailConnectionId?: string | null;
+  notionConnectionId?: string | null;
   status: "creating" | "parsing" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed";
   trigger: {
     type: "email.received";
@@ -28,6 +29,16 @@ export type Task = {
     subjectKeywords: string[];
     bodyKeywords: string[];
     labels: string[];
+  } | {
+    type: "deployment.failed";
+    projectIds: string[];
+    projectNames: string[];
+    environments: Array<"production" | "preview">;
+  } | {
+    type: "notion.page.updated";
+    pageIds: string[];
+    pageTitles: string[];
+    keywords: string[];
   } | null;
   action: {
     type: "calle.call";
@@ -43,6 +54,8 @@ export type Task = {
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
 type GmailConnection = { id: string; email: string; status: "connected" | "needs_reconnect" | "disconnected" };
+type VercelConnection = { id: string; name: string; slug: string; status: "connected" | "needs_reconnect" | "disconnected"; projects: Array<{ id: string; name: string }> };
+type NotionConnection = { id: string; name: string; status: "connected" | "needs_reconnect" | "disconnected"; pages: Array<{ id: string; title: string }> };
 
 function useAnimatedPlaceholder() {
   const [animation, setAnimation] = useState({ text: "", index: 0, deleting: false });
@@ -122,6 +135,10 @@ export function FlowComposer({
   const [selectedSources, setSelectedSources] = useState<string[]>([]);
   const [gmailConnections, setGmailConnections] = useState<GmailConnection[]>([]);
   const [selectedGmailConnectionId, setSelectedGmailConnectionId] = useState("");
+  const [vercelConnections, setVercelConnections] = useState<VercelConnection[]>([]);
+  const [selectedVercelConnectionId, setSelectedVercelConnectionId] = useState("");
+  const [notionConnections, setNotionConnections] = useState<NotionConnection[]>([]);
+  const [selectedNotionConnectionId, setSelectedNotionConnectionId] = useState("");
   const [attachments, setAttachments] = useState<File[]>([]);
   const [retryMissedCalls, setRetryMissedCalls] = useState(true);
   const [confirmBeforeCalling, setConfirmBeforeCalling] = useState(false);
@@ -141,13 +158,28 @@ export function FlowComposer({
 
   useEffect(() => {
     let active = true;
-    fetch(`${apiUrl}/connections/gmail`, { credentials: "include" })
-      .then(async (response) => ({ response, body: await response.json().catch(() => null) as { connections?: GmailConnection[] } | null }))
-      .then(({ response, body }) => {
-        if (!active || !response.ok) return;
-        const connected = (body?.connections ?? []).filter((connection) => connection.status === "connected");
-        setGmailConnections(connected);
-        if (connected.length === 1) setSelectedGmailConnectionId(connected[0]!.id);
+    Promise.all([
+      fetch(`${apiUrl}/connections/gmail`, { credentials: "include" }),
+      fetch(`${apiUrl}/connections/vercel`, { credentials: "include" }),
+      fetch(`${apiUrl}/connections/notion`, { credentials: "include" }),
+    ]).then(async ([gmailResponse, vercelResponse, notionResponse]) => ({
+      gmailResponse,
+      vercelResponse,
+      notionResponse,
+      gmailBody: await gmailResponse.json().catch(() => null) as { connections?: GmailConnection[] } | null,
+      vercelBody: await vercelResponse.json().catch(() => null) as { connections?: VercelConnection[] } | null,
+      notionBody: await notionResponse.json().catch(() => null) as { connections?: NotionConnection[] } | null,
+    })).then(({ gmailResponse, vercelResponse, notionResponse, gmailBody, vercelBody, notionBody }) => {
+        if (!active) return;
+        const gmail = gmailResponse.ok ? (gmailBody?.connections ?? []).filter((connection) => connection.status === "connected") : [];
+        const vercel = vercelResponse.ok ? (vercelBody?.connections ?? []).filter((connection) => connection.status === "connected") : [];
+        const notion = notionResponse.ok ? (notionBody?.connections ?? []).filter((connection) => connection.status === "connected") : [];
+        setGmailConnections(gmail);
+        setVercelConnections(vercel);
+        setNotionConnections(notion);
+        if (gmail.length === 1) setSelectedGmailConnectionId(gmail[0]!.id);
+        if (vercel.length === 1) setSelectedVercelConnectionId(vercel[0]!.id);
+        if (notion.length === 1) setSelectedNotionConnectionId(notion[0]!.id);
       })
       .catch(() => {
         if (active) setError("Could not load Gmail accounts.");
@@ -178,9 +210,7 @@ export function FlowComposer({
   }
 
   function toggleSource(source: string) {
-    setSelectedSources((current) =>
-      current.includes(source) ? current.filter((item) => item !== source) : [...current, source],
-    );
+    setSelectedSources((current) => current.includes(source) ? [] : [source]);
   }
 
   function resetComposer() {
@@ -188,6 +218,7 @@ export function FlowComposer({
     inputRef.current?.replaceChildren();
     setSelectedSources([]);
     setSelectedGmailConnectionId(gmailConnections.length === 1 ? gmailConnections[0]!.id : "");
+    setSelectedVercelConnectionId(vercelConnections.length === 1 ? vercelConnections[0]!.id : "");
     setAttachments([]);
     setClarification(null);
     setClarificationAnswer("");
@@ -210,7 +241,7 @@ export function FlowComposer({
     try {
       const requestKey = clarification
         ? `clarify:${clarification.taskId}:${answer}`
-        : `create:${prompt}:${selectedSources.join(",")}:${selectedGmailConnectionId}`;
+        : `create:${prompt}:${selectedSources.join(",")}:${selectedGmailConnectionId}:${selectedVercelConnectionId}:${selectedNotionConnectionId}`;
       const requestId = requestIds.current.get(requestKey) ?? crypto.randomUUID();
       requestIds.current.set(requestKey, requestId);
       const response = await fetch(
@@ -222,22 +253,32 @@ export function FlowComposer({
           body: JSON.stringify(
             clarification
               ? { requestId, answer }
-              : { requestId, prompt, selectedSources, gmailConnectionId: selectedGmailConnectionId || undefined },
+              : {
+                requestId,
+                prompt,
+                selectedSources,
+                executionMode: confirmBeforeCalling ? "approval" : "automatic",
+                gmailConnectionId: selectedGmailConnectionId || undefined,
+                vercelConnectionId: selectedVercelConnectionId || undefined,
+                notionConnectionId: selectedNotionConnectionId || undefined,
+              },
           ),
         },
       );
       const result = (await response.json().catch(() => null)) as
         | Task
-        | { status?: string; task?: Task; taskId?: string; question?: string; error?: string; connection?: string; connections?: GmailConnection[] }
+        | { status?: string; task?: Task; taskId?: string; question?: string; error?: string; connection?: string; connections?: Array<GmailConnection | VercelConnection | NotionConnection> }
         | null;
 
-      if (response.status === 409 && result && "status" in result && result.status === "connection_required" && result.connection === "gmail") {
-        window.open(`${apiUrl}/connections/gmail/start`, "_self");
+      if (response.status === 409 && result && "status" in result && result.status === "connection_required" && (result.connection === "gmail" || result.connection === "vercel" || result.connection === "notion")) {
+        window.open(`${apiUrl}/connections/${result.connection}/start`, "_self");
         return;
       }
       if (response.status === 409 && result && "status" in result && result.status === "connection_selection_required") {
-        setGmailConnections(result.connections ?? []);
-        setError("Choose the Gmail account this flow should watch under Sources.");
+        if (result.connection === "vercel") setVercelConnections((result.connections ?? []).filter((item): item is VercelConnection => "slug" in item));
+        else if (result.connection === "notion") setNotionConnections((result.connections ?? []).filter((item): item is NotionConnection => "name" in item && "pages" in item));
+        else setGmailConnections((result.connections ?? []).filter((item): item is GmailConnection => "email" in item));
+        setError(`Choose the ${result.connection === "vercel" ? "Vercel" : result.connection === "notion" ? "Notion" : "Gmail"} account this flow should watch under Sources.`);
         return;
       }
       if (!response.ok || !result) {
@@ -382,6 +423,38 @@ export function FlowComposer({
                           className="size-3.5 accent-primary"
                         />
                         <span className="truncate">{connection.email}</span>
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
+                {source === "Vercel" && selectedSources.includes("Vercel") && vercelConnections.length > 1 ? (
+                  <div className="space-y-1 px-2 pb-2">
+                    {vercelConnections.map((connection) => (
+                      <label key={connection.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted">
+                        <input
+                          type="radio"
+                          name="vercel-connection"
+                          checked={selectedVercelConnectionId === connection.id}
+                          onChange={() => setSelectedVercelConnectionId(connection.id)}
+                          className="size-3.5 accent-primary"
+                        />
+                        <span className="truncate">{connection.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                ) : null}
+                {source === "Notion" && selectedSources.includes("Notion") && notionConnections.length > 1 ? (
+                  <div className="space-y-1 px-2 pb-2">
+                    {notionConnections.map((connection) => (
+                      <label key={connection.id} className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-xs hover:bg-muted">
+                        <input
+                          type="radio"
+                          name="notion-connection"
+                          checked={selectedNotionConnectionId === connection.id}
+                          onChange={() => setSelectedNotionConnectionId(connection.id)}
+                          className="size-3.5 accent-primary"
+                        />
+                        <span className="truncate">{connection.name}</span>
                       </label>
                     ))}
                   </div>

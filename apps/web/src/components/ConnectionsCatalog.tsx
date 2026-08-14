@@ -57,6 +57,22 @@ type GmailConnection = {
   watchExpiration?: string;
 };
 
+type VercelConnection = {
+  id: string;
+  status: "connected" | "needs_reconnect" | "disconnected";
+  name: string;
+  slug: string;
+  projects: Array<{ id: string; name: string }>;
+};
+
+type NotionConnection = {
+  id: string;
+  status: "connected" | "needs_reconnect" | "disconnected";
+  name: string;
+  icon: string | null;
+  pages: Array<{ id: string; title: string }>;
+};
+
 type ConnectionFilter = "all" | "connected" | "unconnected";
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
@@ -65,14 +81,22 @@ export function ConnectionsCatalog() {
   const [query, setQuery] = useState("");
   const [connectionFilter, setConnectionFilter] = useState<ConnectionFilter>("all");
   const [gmailConnections, setGmailConnections] = useState<GmailConnection[]>([]);
+  const [vercelConnections, setVercelConnections] = useState<VercelConnection[]>([]);
+  const [notionConnections, setNotionConnections] = useState<NotionConnection[]>([]);
   const [loading, setLoading] = useState(true);
   const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const normalizedQuery = query.trim().toLowerCase();
   const visibleConnections = connections.filter((connection) => {
     const matchesQuery = connection.name.toLowerCase().includes(normalizedQuery)
-      || (connection.name === "Gmail" && gmailConnections.some((gmail) => gmail.email.toLowerCase().includes(normalizedQuery)));
-    return matchesQuery && (connection.name === "Gmail" || connectionFilter !== "connected");
+      || (connection.name === "Gmail" && gmailConnections.some((gmail) => gmail.email.toLowerCase().includes(normalizedQuery)))
+      || (connection.name === "Vercel" && vercelConnections.some((vercel) => `${vercel.name} ${vercel.slug}`.toLowerCase().includes(normalizedQuery)))
+      || (connection.name === "Notion" && notionConnections.some((notion) => notion.name.toLowerCase().includes(normalizedQuery)));
+    const hasConnection = connection.name === "Gmail"
+      ? gmailConnections.some((item) => item.status === "connected")
+      : connection.name === "Vercel" ? vercelConnections.some((item) => item.status === "connected")
+        : connection.name === "Notion" ? notionConnections.some((item) => item.status === "connected") : false;
+    return matchesQuery && (connectionFilter === "all" || (connectionFilter === "connected" ? hasConnection : !hasConnection));
   });
 
   useEffect(() => {
@@ -80,13 +104,29 @@ export function ConnectionsCatalog() {
 
     async function loadConnections() {
       try {
-        const gmailResponse = await fetch(`${apiUrl}/connections/gmail`, { credentials: "include" });
-        const gmailResult = await gmailResponse.json().catch(() => null) as { connections?: GmailConnection[]; error?: string } | null;
+        const [gmailResponse, vercelResponse, notionResponse] = await Promise.all([
+          fetch(`${apiUrl}/connections/gmail`, { credentials: "include" }),
+          fetch(`${apiUrl}/connections/vercel`, { credentials: "include" }),
+          fetch(`${apiUrl}/connections/notion`, { credentials: "include" }),
+        ]);
+        const [gmailResult, vercelResult, notionResult] = await Promise.all([
+          gmailResponse.json().catch(() => null) as Promise<{ connections?: GmailConnection[]; error?: string } | null>,
+          vercelResponse.json().catch(() => null) as Promise<{ connections?: VercelConnection[]; error?: string } | null>,
+          notionResponse.json().catch(() => null) as Promise<{ connections?: NotionConnection[]; error?: string } | null>,
+        ]);
         if (!gmailResponse.ok || !gmailResult || !("connections" in gmailResult)) {
           throw new Error(gmailResult?.error ?? "Could not load Gmail connections");
         }
+        if (!vercelResponse.ok || !vercelResult || !("connections" in vercelResult)) {
+          throw new Error(vercelResult?.error ?? "Could not load Vercel connections");
+        }
+        if (!notionResponse.ok || !notionResult || !("connections" in notionResult)) {
+          throw new Error(notionResult?.error ?? "Could not load Notion connections");
+        }
         if (active) {
           setGmailConnections(gmailResult.connections ?? []);
+          setVercelConnections(vercelResult.connections ?? []);
+          setNotionConnections(notionResult.connections ?? []);
         }
       } catch (caught) {
         if (active) setError(caught instanceof Error ? caught.message : "Could not load connections");
@@ -113,6 +153,37 @@ export function ConnectionsCatalog() {
       if (result?.warning) setError(result.warning);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not disconnect Gmail");
+    } finally {
+      setDisconnectingId(null);
+    }
+  }
+
+  async function disconnectVercel(id: string) {
+    setDisconnectingId(id);
+    setError("");
+    try {
+      const response = await fetch(`${apiUrl}/connections/vercel/${id}`, { method: "DELETE", credentials: "include" });
+      const result = await response.json().catch(() => null) as { error?: string } | null;
+      if (!response.ok) throw new Error(result?.error ?? "Could not disconnect Vercel");
+      setVercelConnections((current) => current.filter((connection) => connection.id !== id));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not disconnect Vercel");
+    } finally {
+      setDisconnectingId(null);
+    }
+  }
+
+  async function disconnectNotion(id: string) {
+    setDisconnectingId(id);
+    setError("");
+    try {
+      const response = await fetch(`${apiUrl}/connections/notion/${id}`, { method: "DELETE", credentials: "include" });
+      const result = await response.json().catch(() => null) as { error?: string; warning?: string } | null;
+      if (!response.ok) throw new Error(result?.error ?? "Could not disconnect Notion");
+      setNotionConnections((current) => current.filter((connection) => connection.id !== id));
+      if (result?.warning) setError(result.warning);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not disconnect Notion");
     } finally {
       setDisconnectingId(null);
     }
@@ -166,6 +237,44 @@ export function ConnectionsCatalog() {
       {visibleConnections.length ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {visibleConnections.flatMap((connection) => {
+            if (connection.name === "Vercel") {
+              const vercelCards = vercelConnections.map((vercel) => (
+                <ConnectionCard
+                  key={vercel.id}
+                  {...connection}
+                  status={vercel.status}
+                  detail={`${vercel.name} · ${vercel.projects.length} project${vercel.projects.length === 1 ? "" : "s"}`}
+                  busy={loading || disconnectingId === vercel.id}
+                  connectHref={vercel.status === "needs_reconnect" ? `${apiUrl}/connections/vercel/start` : undefined}
+                  onDisconnect={() => void disconnectVercel(vercel.id)}
+                />
+              ));
+              return [
+                ...vercelCards,
+                ...(connectionFilter !== "connected" ? [
+                  <ConnectionCard key="vercel-add" {...connection} status="disconnected" detail={vercelConnections.length ? "Add another Vercel account" : undefined} busy={loading} connectHref={loading ? undefined : `${apiUrl}/connections/vercel/start`} />,
+                ] : []),
+              ];
+            }
+            if (connection.name === "Notion") {
+              const notionCards = notionConnections.map((notion) => (
+                <ConnectionCard
+                  key={notion.id}
+                  {...connection}
+                  status={notion.status}
+                  detail={`${notion.name} · ${notion.pages.length} shared page${notion.pages.length === 1 ? "" : "s"}`}
+                  busy={loading || disconnectingId === notion.id}
+                  connectHref={notion.status === "needs_reconnect" ? `${apiUrl}/connections/notion/start` : undefined}
+                  onDisconnect={() => void disconnectNotion(notion.id)}
+                />
+              ));
+              return [
+                ...notionCards,
+                ...(connectionFilter !== "connected" ? [
+                  <ConnectionCard key="notion-add" {...connection} status="disconnected" detail={notionConnections.length ? "Add another Notion workspace" : undefined} busy={loading} connectHref={loading ? undefined : `${apiUrl}/connections/notion/start`} />,
+                ] : []),
+              ];
+            }
             if (connection.name !== "Gmail") return <ConnectionCard key={connection.name} {...connection} />;
             const gmailCards = gmailConnections.filter((gmail) => connectionFilter === "all" || (connectionFilter === "connected" ? gmail.status === "connected" : gmail.status !== "connected")).map((gmail) => (
               <ConnectionCard

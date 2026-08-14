@@ -13,6 +13,16 @@ const context: TaskAgentContext = {
     labels: ['IMPORTANT', 'Receipts'],
     labelIds: { IMPORTANT: 'IMPORTANT', Receipts: 'Label_1' },
   },
+  vercel: {
+    connected: false,
+    accountName: null,
+    projects: [],
+  },
+  notion: {
+    connected: false,
+    workspaceName: null,
+    pages: [],
+  },
   contacts: [{
     id: 'contact-1',
     name: 'Aarav Mehta',
@@ -45,6 +55,34 @@ describe('task plan validation', () => {
     expect(taskPromptSchema.safeParse(complete).success).toBe(true)
     expect(taskPromptSchema.safeParse({ status: 'needs_clarification', question: 'Which email address should match?' }).success).toBe(true)
     expect(validateTaskResult(complete, context)).toEqual(complete)
+  })
+
+  test('accepts a connected Vercel deployment failure plan', () => {
+    const vercelPlan = {
+      status: 'complete' as const,
+      trigger: {
+        source: 'vercel' as const,
+        event: 'deployment.failed' as const,
+        rules: { projectIds: ['prj_1'], projectNames: ['web'], environments: ['production' as const] },
+      },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain that the production deployment failed.' },
+    }
+    const vercelContext = { ...context, vercel: { connected: true, accountName: 'My team', projects: [{ id: 'prj_1', name: 'web' }] } }
+    expect(validateTaskResult(vercelPlan, vercelContext)).toEqual(vercelPlan)
+  })
+
+  test('accepts a connected Notion page update plan', () => {
+    const notionPlan = {
+      status: 'complete' as const,
+      trigger: {
+        source: 'notion' as const,
+        event: 'page.updated' as const,
+        rules: { pageIds: ['page-1'], pageTitles: ['Incidents'], keywords: ['production incident'] },
+      },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain the relevant Notion update.' },
+    }
+    const notionContext = { ...context, notion: { connected: true, workspaceName: 'Engineering', pages: [{ id: 'page-1', title: 'Incidents' }] } }
+    expect(validateTaskResult(notionPlan, notionContext)).toEqual(notionPlan)
   })
 
   test('rejects unsupported output and unresolved context values', () => {

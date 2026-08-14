@@ -1,13 +1,13 @@
-// Hono API for authentication, persisted tasks, Gmail connections, Pub/Sub delivery, and CALL-E webhooks.
+// Hono API for authentication, source connections, persisted tasks, and provider webhooks.
 import { randomBytes, randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { clearSession, cookieValue, currentSession, finishGoogleAuth, sessionCookie, startGoogleAuth, type Session } from "./auth";
 import { confirmedReplyInstruction, createCalleCall, getCalleCall, normalizePhone } from "./calle";
 import {
-  createContact, createTask, decideTaskRunApproval, disconnectGmail, enqueueGmailNotification, findTaskByRequest, getGmailConnection,
+  createContact, createTask, decideTaskRunApproval, disconnectGmail, disconnectNotion, disconnectVercel, enqueueGmailNotification, findTaskByRequest, getGmailConnection,
   getGmailConnectionByAddress, getProfile, getTask, getTaskContext, initializeDatabase, listCallTasks, listContacts, queueConfirmedEmailReply,
-  listGmailConnections, listTaskRuns, listTasks, resolveTaskClarification, saveCallTask, saveGmailConnection, updateCallTask,
+  listGmailConnections, listNotionConnections, listTaskRuns, listTasks, listVercelConnections, resolveTaskClarification, saveCallTask, saveGmailConnection, saveNotionConnection, saveVercelConnection, updateCallTask,
   updateContactEmail, updateProfile, updateTaskClarification, updateTaskStatus, upsertUser, type TaskAction, type TaskTrigger,
 } from "./db";
 import {
@@ -15,6 +15,8 @@ import {
   getGmailProfile, listGmailLabels, verifyPubSubOidc, watchInbox,
 } from "./gmail";
 import { parseTaskPrompt, TaskParserError, type TaskAgentContext, type TaskParseResult } from "./task-agent";
+import { buildVercelInstallUrl, exchangeVercelCode, getVercelAccount, listVercelProjects } from "./vercel";
+import { buildNotionOAuthUrl, exchangeNotionCode, listNotionPages, revokeNotionToken } from "./notion";
 
 const app = new Hono();
 const webOrigin = new URL(process.env.WEB_URL ?? "http://localhost:3006/home").origin;
@@ -48,6 +50,16 @@ function taskContext(session: Session, context: Awaited<ReturnType<typeof getTas
       labels: Object.keys(context.gmail?.labelMap ?? {}),
       labelIds: context.gmail?.labelMap ?? {},
     },
+    vercel: {
+      connected: context.vercel?.status === "connected",
+      accountName: context.vercel?.accountName ?? null,
+      projects: context.vercel?.projects ?? [],
+    },
+    notion: {
+      connected: context.notion?.status === "connected",
+      workspaceName: context.notion?.workspaceName ?? null,
+      pages: context.notion?.pages.map(({ id, title }) => ({ id, title })) ?? [],
+    },
     contacts: context.contacts.map(({ id, name, email, phone }) => ({ id, name, email, phone })),
   };
 }
@@ -58,13 +70,23 @@ function publicTaskResult(result: TaskParseResult, context: TaskAgentContext, ex
   const contact = target.type === "contact" ? context.contacts.find(({ id }) => id === target.contactId) : null;
   const phone = target.type === "self" ? context.currentUser.defaultPhone : contact?.phone;
   if (!phone || !normalizePhone(phone)) return { status: "needs_clarification" as const, question: "What E.164 phone number should Kordy call?" };
-  const trigger: TaskTrigger = {
+  const trigger: TaskTrigger = result.trigger.source === "gmail" ? {
     type: "email.received",
     match: "and",
     senders: result.trigger.rules.senders.map((value) => value.toLowerCase()),
     subjectKeywords: result.trigger.rules.subjectKeywords,
     bodyKeywords: result.trigger.rules.bodyKeywords,
     labels: result.trigger.rules.labels.map((name) => context.gmail.labelIds[name]!),
+  } : result.trigger.source === "vercel" ? {
+    type: "deployment.failed",
+    projectIds: result.trigger.rules.projectIds,
+    projectNames: result.trigger.rules.projectNames,
+    environments: result.trigger.rules.environments,
+  } : {
+    type: "notion.page.updated",
+    pageIds: result.trigger.rules.pageIds,
+    pageTitles: result.trigger.rules.pageTitles,
+    keywords: result.trigger.rules.keywords,
   };
   const action: TaskAction = {
     type: "calle.call",
@@ -78,8 +100,8 @@ function publicTaskResult(result: TaskParseResult, context: TaskAgentContext, ex
   return { status: "complete" as const, trigger, action };
 }
 
-async function parseWithContext(session: Session, prompt: string, gmailConnectionId: string, executionMode: "automatic" | "approval" = "automatic") {
-  const context = taskContext(session, await getTaskContext(session.sub, gmailConnectionId));
+async function parseWithContext(session: Session, prompt: string, connections: { gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null }, executionMode: "automatic" | "approval" = "automatic") {
+  const context = taskContext(session, await getTaskContext(session.sub, connections));
   const parsed = await parseTaskPrompt(prompt, context);
   return { context, result: publicTaskResult(parsed.result, context, executionMode), model: parsed.model };
 }
@@ -137,24 +159,44 @@ app.post("/tasks", async (c) => {
   const requestId = typeof body?.requestId === "string" ? body.requestId.trim() : "";
   const prompt = typeof body?.prompt === "string" ? body.prompt.trim() : "";
   const gmailConnectionId = typeof body?.gmailConnectionId === "string" ? body.gmailConnectionId.trim() : "";
+  const vercelConnectionId = typeof body?.vercelConnectionId === "string" ? body.vercelConnectionId.trim() : "";
+  const notionConnectionId = typeof body?.notionConnectionId === "string" ? body.notionConnectionId.trim() : "";
   const executionMode = body?.executionMode === "approval" ? "approval" : "automatic";
   const selectedSources = Array.isArray(body?.selectedSources) ? body.selectedSources.filter((item: unknown): item is string => typeof item === "string") : [];
   if (!requestId || requestId.length > 180 || !prompt || prompt.length > 4000) return c.json({ error: "requestId and a prompt up to 4000 characters are required" }, 400);
-  if (selectedSources.some((source: string) => source.toLowerCase() !== "gmail")) return c.json({ error: "Only Gmail sources are supported in this milestone" }, 400);
+  const requestedSources = [...new Set(selectedSources.map((source: string) => source.toLowerCase()).filter((source: string) => source === "gmail" || source === "vercel" || source === "notion"))];
+  if (requestedSources.length > 1) return c.json({ error: "Create one source trigger per flow" }, 400);
+  const source = requestedSources[0] ?? (/\bnotion\b/i.test(prompt) ? "notion" : /\b(?:vercel|deploy(?:ment)?|build)\b/i.test(prompt) ? "vercel" : "gmail");
   const existing = await findTaskByRequest(session.sub, requestId);
   if (existing) return existing.status === "needs_clarification"
     ? c.json({ status: "needs_clarification", taskId: existing.id, question: existing.clarificationQuestion })
     : c.json({ status: existing.status, task: existing });
-  const gmailConnections = (await listGmailConnections(session.sub)).filter((connection) => connection.status === "connected");
-  if (!gmailConnections.length) return c.json({ status: "connection_required", connection: "gmail" }, 409);
-  const gmail = gmailConnectionId ? gmailConnections.find((connection) => connection.id === gmailConnectionId) : gmailConnections.length === 1 ? gmailConnections[0] : null;
-  if (!gmail) return c.json({
+  const sourceConnections = source === "gmail"
+    ? (await listGmailConnections(session.sub)).filter((connection) => connection.status === "connected")
+    : source === "vercel"
+      ? (await listVercelConnections(session.sub)).filter((connection) => connection.status === "connected")
+      : (await listNotionConnections(session.sub)).filter((connection) => connection.status === "connected");
+  if (!sourceConnections.length) return c.json({ status: "connection_required", connection: source }, 409);
+  const requestedConnectionId = source === "gmail" ? gmailConnectionId : source === "vercel" ? vercelConnectionId : notionConnectionId;
+  const connection = requestedConnectionId
+    ? sourceConnections.find((item) => item.id === requestedConnectionId)
+    : sourceConnections.length === 1 ? sourceConnections[0] : null;
+  if (!connection) return c.json({
     status: "connection_selection_required",
-    connection: "gmail",
-    connections: gmailConnections.map(({ id, gmailAddress }) => ({ id, email: gmailAddress })),
+    connection: source,
+    connections: sourceConnections.map((item) => ({
+      id: item.id,
+      email: "gmailAddress" in item ? item.gmailAddress : undefined,
+      name: "accountName" in item ? item.accountName : "workspaceName" in item ? item.workspaceName : undefined,
+      slug: "accountSlug" in item ? item.accountSlug : undefined,
+      pages: "workspaceName" in item ? item.pages : undefined,
+    })),
   }, 409);
 
-  const task = await createTask({ id: randomUUID(), userId: session.sub, requestId, prompt, status: "creating", gmailConnectionId: gmail.id, parserModel: "pending", executionMode });
+  const task = await createTask({
+    id: randomUUID(), userId: session.sub, requestId, prompt, status: "creating", parserModel: "pending", executionMode,
+    ...(source === "gmail" ? { gmailConnectionId: connection.id } : source === "vercel" ? { vercelConnectionId: connection.id } : { notionConnectionId: connection.id }),
+  });
   if (!task) throw new Error("Task creation did not return a row");
   return c.json({ status: task.status, task }, 202);
 });
@@ -179,15 +221,17 @@ app.post("/tasks/:id/clarify", async (c) => {
     const matches = contacts.filter((contact) => contact.name.toLowerCase() === mention || contact.name.toLowerCase().includes(mention));
     if (matches.length === 1) await updateContactEmail(session.sub, matches[0]!.id, answer.toLowerCase());
   }
-  if (!task.gmailConnectionId) return c.json({ status: "connection_required", connection: "gmail" }, 409);
+  const source = task.notionConnectionId ? "notion" : task.vercelConnectionId ? "vercel" : "gmail";
+  if (!task.gmailConnectionId && !task.vercelConnectionId && !task.notionConnectionId) return c.json({ status: "connection_required", connection: source }, 409);
   const prompt = `${task.originalPrompt}\nClarification answer: ${answer}`;
   try {
-    const { context, result, model } = await parseWithContext(session, prompt, task.gmailConnectionId, task.action?.executionMode ?? "automatic");
+    const connections = { gmailConnectionId: task.gmailConnectionId, vercelConnectionId: task.vercelConnectionId, notionConnectionId: task.notionConnectionId };
+    const { context, result, model } = await parseWithContext(session, prompt, connections, task.action?.executionMode ?? "automatic");
     if (result.status === "needs_clarification") {
       await updateTaskClarification(session.sub, task.id, result.question, context, model);
       return c.json({ status: "needs_clarification", taskId: task.id, question: result.question });
     }
-    const resolved = await resolveTaskClarification({ id: task.id, userId: session.sub, gmailConnectionId: task.gmailConnectionId, prompt, trigger: result.trigger, action: result.action, parserModel: model });
+    const resolved = await resolveTaskClarification({ id: task.id, userId: session.sub, ...connections, prompt, trigger: result.trigger, action: result.action, parserModel: model });
     return c.json({ status: "active", task: resolved });
   } catch (error) {
     if (error instanceof TaskParserError) return c.json({ error: error.message }, 422);
@@ -276,6 +320,129 @@ app.delete("/connections/gmail/:id", async (c) => {
     if (!response.ok) warning = "The local connection was removed, but Google token revocation could not be confirmed.";
   }
   await disconnectGmail(connection.id);
+  return c.json({ ok: true, warning });
+});
+
+app.get("/connections/vercel", async (c) => {
+  const session = await user(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const connections = await listVercelConnections(session.sub);
+  return c.json({ connections: connections.map(({ id, status, accountName, accountSlug, projects }) => ({ id, status, name: accountName, slug: accountSlug, projects })) });
+});
+
+app.get("/connections/vercel/start", async (c) => {
+  const session = await user(c);
+  if (!session) return c.redirect(`${webOrigin}/login`);
+  requiredEnv("VERCEL_INTEGRATION_SLUG", "VERCEL_CLIENT_ID", "VERCEL_REDIRECT_URI");
+  const state = randomBytes(24).toString("base64url");
+  c.header("Set-Cookie", sessionCookie("vercel_oauth_state", state, 600));
+  return c.redirect(buildVercelInstallUrl(process.env.VERCEL_INTEGRATION_SLUG!, state));
+});
+
+app.get("/connections/vercel/callback", async (c) => {
+  const session = await user(c);
+  if (!session) return c.text("Unauthorized", 401);
+  const state = c.req.query("state");
+  if (!state || state !== cookieValue(c.req.header("Cookie"), "vercel_oauth_state")) return c.text("Invalid OAuth state", 400);
+  const code = c.req.query("code");
+  if (!code) return c.text("Missing OAuth code", 400);
+  requiredEnv("VERCEL_CLIENT_ID", "VERCEL_CLIENT_SECRET", "VERCEL_REDIRECT_URI", "TOKEN_ENCRYPTION_KEY");
+  const token = await exchangeVercelCode({
+    code,
+    clientId: process.env.VERCEL_CLIENT_ID!,
+    clientSecret: process.env.VERCEL_CLIENT_SECRET!,
+    redirectUri: process.env.VERCEL_REDIRECT_URI!,
+  });
+  const [account, projects] = await Promise.all([
+    getVercelAccount(token.access_token, token.user_id, token.team_id),
+    listVercelProjects(token.access_token, token.team_id),
+  ]);
+  await saveVercelConnection({
+    id: token.installation_id,
+    userId: session.sub,
+    accountId: account.id,
+    accountName: account.name,
+    accountSlug: account.slug,
+    teamId: token.team_id,
+    encryptedAccessToken: encryptToken(token.access_token),
+    projects,
+    status: "connected",
+  });
+  c.header("Set-Cookie", sessionCookie("vercel_oauth_state", "", 0));
+  return c.redirect(`${webOrigin}/connections?vercel=connected`);
+});
+
+app.delete("/connections/vercel/:id", async (c) => {
+  const session = await user(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const connection = (await listVercelConnections(session.sub)).find((item) => item.id === c.req.param("id"));
+  if (!connection) return c.json({ error: "Vercel connection not found" }, 404);
+  await disconnectVercel(connection.id);
+  return c.json({ ok: true });
+});
+
+app.get("/connections/notion", async (c) => {
+  const session = await user(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const connections = await listNotionConnections(session.sub);
+  return c.json({ connections: connections.map(({ id, status, workspaceName, workspaceIcon, pages }) => ({ id, status, name: workspaceName, icon: workspaceIcon, pages })) });
+});
+
+app.get("/connections/notion/start", async (c) => {
+  const session = await user(c);
+  if (!session) return c.redirect(`${webOrigin}/login`);
+  requiredEnv("NOTION_CLIENT_ID", "NOTION_REDIRECT_URI");
+  const state = randomBytes(24).toString("base64url");
+  c.header("Set-Cookie", sessionCookie("notion_oauth_state", state, 600));
+  return c.redirect(buildNotionOAuthUrl({ clientId: process.env.NOTION_CLIENT_ID!, redirectUri: process.env.NOTION_REDIRECT_URI!, state }));
+});
+
+app.get("/connections/notion/callback", async (c) => {
+  const session = await user(c);
+  if (!session) return c.text("Unauthorized", 401);
+  const state = c.req.query("state");
+  if (!state || state !== cookieValue(c.req.header("Cookie"), "notion_oauth_state")) return c.text("Invalid OAuth state", 400);
+  const code = c.req.query("code");
+  if (!code) return c.text("Missing OAuth code", 400);
+  requiredEnv("NOTION_CLIENT_ID", "NOTION_CLIENT_SECRET", "NOTION_REDIRECT_URI", "TOKEN_ENCRYPTION_KEY");
+  const token = await exchangeNotionCode({
+    code,
+    clientId: process.env.NOTION_CLIENT_ID!,
+    clientSecret: process.env.NOTION_CLIENT_SECRET!,
+    redirectUri: process.env.NOTION_REDIRECT_URI!,
+  });
+  const existing = (await listNotionConnections(session.sub)).find((connection) => connection.workspaceId === token.workspace_id);
+  const refreshToken = token.refresh_token ?? (existing?.encryptedRefreshToken ? decryptToken(existing.encryptedRefreshToken) : null);
+  if (!refreshToken) return c.text("Notion did not return a refresh token. Reconnect the workspace.", 400);
+  const pages = await listNotionPages(token.access_token);
+  await saveNotionConnection({
+    id: existing?.id ?? token.bot_id,
+    userId: session.sub,
+    workspaceId: token.workspace_id,
+    workspaceName: token.workspace_name ?? "Notion workspace",
+    workspaceIcon: token.workspace_icon,
+    encryptedAccessToken: encryptToken(token.access_token),
+    encryptedRefreshToken: encryptToken(refreshToken),
+    pages: pages.map(({ id, title, url }) => ({ id, title, url })),
+    status: "connected",
+  });
+  c.header("Set-Cookie", sessionCookie("notion_oauth_state", "", 0));
+  return c.redirect(`${webOrigin}/connections?notion=connected`);
+});
+
+app.delete("/connections/notion/:id", async (c) => {
+  const session = await user(c);
+  if (!session) return c.json({ error: "Unauthorized" }, 401);
+  const connection = (await listNotionConnections(session.sub)).find((item) => item.id === c.req.param("id"));
+  if (!connection) return c.json({ error: "Notion connection not found" }, 404);
+  let warning: string | undefined;
+  try {
+    requiredEnv("NOTION_CLIENT_ID", "NOTION_CLIENT_SECRET");
+    await revokeNotionToken(decryptToken(connection.encryptedAccessToken), process.env.NOTION_CLIENT_ID!, process.env.NOTION_CLIENT_SECRET!);
+  } catch {
+    warning = "The local connection was removed, but Notion token revocation could not be confirmed.";
+  }
+  await disconnectNotion(connection.id);
   return c.json({ ok: true, warning });
 });
 

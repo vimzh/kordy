@@ -35,6 +35,15 @@ function statusLabel(status: Task["status"]) {
 
 function sourceContext(task: Task) {
   if (!task.trigger) return task.clarificationQuestion ?? "Trigger details were not resolved.";
+  if (task.trigger.type === "deployment.failed") {
+    const projects = task.trigger.projectNames.length ? task.trigger.projectNames.join(", ") : "all projects";
+    const environments = task.trigger.environments.length ? task.trigger.environments.join(" and ") : "all environments";
+    return `${projects} · ${environments}`;
+  }
+  if (task.trigger.type === "notion.page.updated") {
+    const pages = task.trigger.pageTitles.length ? task.trigger.pageTitles.join(", ") : "all shared pages";
+    return task.trigger.keywords.length ? `${pages} · ${task.trigger.keywords.join(", ")}` : `${pages} · any update`;
+  }
   const values = [
     ...task.trigger.senders,
     ...task.trigger.subjectKeywords,
@@ -42,6 +51,10 @@ function sourceContext(task: Task) {
     ...task.trigger.labels,
   ];
   return values.length ? values.join(", ") : "All incoming Gmail messages";
+}
+
+function sourceName(task: Task) {
+  return task.trigger?.type === "deployment.failed" ? "Vercel" : task.trigger?.type === "notion.page.updated" ? "Notion" : "Gmail";
 }
 
 function useTasks() {
@@ -172,7 +185,7 @@ function TriggerCard({
           </div>
           <div className="flex items-center justify-between gap-4">
             <dt className="flex items-center gap-2 text-muted-foreground"><Database className="size-4" /> Source</dt>
-            <dd className="truncate font-medium">Gmail</dd>
+            <dd className="truncate font-medium">{sourceName(task)}</dd>
           </div>
         </dl>
         <TaskActions task={task} updating={updating} onStatus={onStatus} />
@@ -262,7 +275,7 @@ export function TriggersOverview({ contacts }: { contacts: Contact[] }) {
                     </TableCell>
                     <TableCell>{task.action?.targetName ?? "Not resolved"}</TableCell>
                     <TableCell><Badge variant="outline">{statusLabel(task.status)}</Badge></TableCell>
-                    <TableCell>Gmail</TableCell>
+                    <TableCell>{sourceName(task)}</TableCell>
                     <TableCell className="pr-6">
                       <TaskActions task={task} updating={updatingId === task.id} onStatus={(status) => void updateStatus(task, status)} />
                     </TableCell>
@@ -305,7 +318,7 @@ export function TriggerDetails({ taskId }: { taskId: string }) {
               </div>
               <div>
                 <dt className="text-xs font-medium text-muted-foreground">Source</dt>
-                <dd className="mt-1 text-sm">Gmail</dd>
+                <dd className="mt-1 text-sm">{sourceName(task)}</dd>
               </div>
               <div className="sm:col-span-2">
                 <dt className="text-xs font-medium text-muted-foreground">Matching email context</dt>
