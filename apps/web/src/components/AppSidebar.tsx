@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { House, LogOut, Plug, Users, Zap } from "lucide-react";
+import { House, LogOut, Plug, Settings, Users, Zap } from "lucide-react";
 import { useState } from "react";
 import {
   DropdownMenu,
@@ -28,6 +28,7 @@ const navItems = [
   { label: "Triggers", href: "/triggers", icon: Zap },
   { label: "Connections", href: "/connections", icon: Plug },
   { label: "Contacts", href: "/contacts", icon: Users },
+  { label: "Settings", href: "/settings", icon: Settings },
 ] as const;
 
 export function AppSidebar({

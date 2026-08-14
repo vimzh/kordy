@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { MessageSquare, Plus, Search } from "lucide-react";
 import {
   SiAirtable,
@@ -50,11 +50,73 @@ const connections = [
   { name: "Zapier", description: "Connect existing automations and app workflows.", icon: SiZapier },
 ] as const;
 
+type GmailConnection = {
+  id: string;
+  status: "connected" | "needs_reconnect" | "disconnected";
+  email: string;
+  watchExpiration?: string;
+};
+
+type ConnectionFilter = "all" | "connected" | "unconnected";
+
+const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
+
 export function ConnectionsCatalog() {
   const [query, setQuery] = useState("");
-  const visibleConnections = connections.filter((connection) =>
-    connection.name.toLowerCase().includes(query.trim().toLowerCase()),
-  );
+  const [connectionFilter, setConnectionFilter] = useState<ConnectionFilter>("all");
+  const [gmailConnections, setGmailConnections] = useState<GmailConnection[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleConnections = connections.filter((connection) => {
+    const matchesQuery = connection.name.toLowerCase().includes(normalizedQuery)
+      || (connection.name === "Gmail" && gmailConnections.some((gmail) => gmail.email.toLowerCase().includes(normalizedQuery)));
+    return matchesQuery && (connection.name === "Gmail" || connectionFilter !== "connected");
+  });
+
+  useEffect(() => {
+    let active = true;
+
+    async function loadConnections() {
+      try {
+        const gmailResponse = await fetch(`${apiUrl}/connections/gmail`, { credentials: "include" });
+        const gmailResult = await gmailResponse.json().catch(() => null) as { connections?: GmailConnection[]; error?: string } | null;
+        if (!gmailResponse.ok || !gmailResult || !("connections" in gmailResult)) {
+          throw new Error(gmailResult?.error ?? "Could not load Gmail connections");
+        }
+        if (active) {
+          setGmailConnections(gmailResult.connections ?? []);
+        }
+      } catch (caught) {
+        if (active) setError(caught instanceof Error ? caught.message : "Could not load connections");
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    void loadConnections();
+    return () => { active = false; };
+  }, []);
+
+  async function disconnectGmail(id: string) {
+    setDisconnectingId(id);
+    setError("");
+    try {
+      const response = await fetch(`${apiUrl}/connections/gmail/${id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const result = (await response.json().catch(() => null)) as { error?: string; warning?: string } | null;
+      if (!response.ok) throw new Error(result?.error ?? "Could not disconnect Gmail");
+      setGmailConnections((current) => current.filter((connection) => connection.id !== id));
+      if (result?.warning) setError(result.warning);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not disconnect Gmail");
+    } finally {
+      setDisconnectingId(null);
+    }
+  }
 
   return (
     <div className="space-y-8">
@@ -84,15 +146,56 @@ export function ConnectionsCatalog() {
         </div>
       </div>
 
+      {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
+
+      <div className="flex flex-wrap items-center gap-2" aria-label="Connection filters">
+        {(["all", "connected", "unconnected"] as const).map((filter) => (
+          <Button
+            key={filter}
+            type="button"
+            size="sm"
+            variant={connectionFilter === filter ? "secondary" : "outline"}
+            aria-pressed={connectionFilter === filter}
+            onClick={() => setConnectionFilter(filter)}
+          >
+            {filter[0]!.toUpperCase() + filter.slice(1)}
+          </Button>
+        ))}
+      </div>
+
       {visibleConnections.length ? (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-          {visibleConnections.map((connection) => (
-            <ConnectionCard key={connection.name} {...connection} />
-          ))}
+          {visibleConnections.flatMap((connection) => {
+            if (connection.name !== "Gmail") return <ConnectionCard key={connection.name} {...connection} />;
+            const gmailCards = gmailConnections.filter((gmail) => connectionFilter === "all" || (connectionFilter === "connected" ? gmail.status === "connected" : gmail.status !== "connected")).map((gmail) => (
+              <ConnectionCard
+                key={gmail.id}
+                {...connection}
+                status={gmail.status}
+                detail={`Connected account: ${gmail.email}`}
+                busy={loading || disconnectingId === gmail.id}
+                connectHref={gmail.status === "needs_reconnect" && !loading ? `${apiUrl}/connections/gmail/start` : undefined}
+                onDisconnect={() => void disconnectGmail(gmail.id)}
+              />
+            ));
+            return [
+              ...gmailCards,
+              ...(connectionFilter !== "connected" ? [
+                <ConnectionCard
+                  key="gmail-add"
+                  {...connection}
+                  status="disconnected"
+                  detail={gmailConnections.length ? "Add another Gmail account" : undefined}
+                  busy={loading}
+                  connectHref={loading ? undefined : `${apiUrl}/connections/gmail/start`}
+                />,
+              ] : []),
+            ];
+          })}
         </div>
       ) : (
         <div className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
-          No connections match “{query}”.
+          No connections match these filters.
         </div>
       )}
     </div>

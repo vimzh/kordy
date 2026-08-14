@@ -35,6 +35,7 @@ export type Contact = {
   name: string;
   summary: string;
   phone: string;
+  email: string | null;
   createdAt: string;
 };
 
@@ -55,6 +56,7 @@ export function ContactsTable({ initialContacts }: { initialContacts: Contact[] 
       name: values.name,
       summary: values.summary,
       phone: `${values.countryCode} ${values.phoneNumber}`,
+      email: values.email,
     };
     setSaving(true);
     setError("");
@@ -138,6 +140,10 @@ export function ContactsTable({ initialContacts }: { initialContacts: Contact[] 
                   />
                 </div>
               </div>
+              <div className="space-y-2">
+                <Label htmlFor="contact-email">Email (optional)</Label>
+                <Input id="contact-email" name="email" type="email" maxLength={254} placeholder="alex@example.com" />
+              </div>
               {error ? <p role="alert" className="text-sm text-destructive">{error}</p> : null}
               <DialogFooter>
                 <Button type="submit" disabled={saving}>{saving ? "Adding…" : "Add contact"}</Button>
@@ -154,6 +160,7 @@ export function ContactsTable({ initialContacts }: { initialContacts: Contact[] 
               <TableHead>Name</TableHead>
               <TableHead>Who they are</TableHead>
               <TableHead>Contact number</TableHead>
+              <TableHead>Email</TableHead>
               <TableHead>Added</TableHead>
             </TableRow>
           </TableHeader>
@@ -163,6 +170,7 @@ export function ContactsTable({ initialContacts }: { initialContacts: Contact[] 
                 <TableCell className="font-medium">{contact.name}</TableCell>
                 <TableCell className="max-w-xl whitespace-normal text-muted-foreground">{contact.summary}</TableCell>
                 <TableCell><a className="hover:underline" href={`tel:${contact.phone}`}>{contact.phone}</a></TableCell>
+                <TableCell>{contact.email ? <a className="hover:underline" href={`mailto:${contact.email}`}>{contact.email}</a> : "—"}</TableCell>
                 <TableCell className="text-muted-foreground">
                   <time dateTime={contact.createdAt}>{dateFormatter.format(new Date(contact.createdAt))}</time>
                 </TableCell>

@@ -1,17 +1,29 @@
 {
   "name": "@kyub/api",
   "scripts": {
-    "dev": "bun run --hot src/index.ts",
-    "build": "bun build src/index.ts --target bun --outdir dist",
+    "dev": "bun run --watch src/index.ts",
+    "worker": "bun run src/worker.ts",
+    "dev:worker": "bun run --watch src/worker.ts",
+    "gmail:tunnel": "bun run src/gmail-tunnel.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:push": "drizzle-kit push",
+    "db:studio": "drizzle-kit studio",
+    "build": "bun build src/index.ts src/worker.ts --target bun --outdir dist",
     "start": "bun run dist/index.js",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "hono": "^4.13.2"
+    "@ai-sdk/openai": "^4.0.41",
+    "ai": "^7.0.65",
+    "drizzle-orm": "^1.0.0-rc.4",
+    "google-auth-library": "^11.0.2",
+    "hono": "^4.13.2",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "latest",
+    "drizzle-kit": "^1.0.0-rc.4",
     "typescript": "^5"
   }
 }

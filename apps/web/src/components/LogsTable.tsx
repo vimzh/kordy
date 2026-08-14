@@ -1,3 +1,4 @@
+import type { Task } from "@/components/FlowComposer";
 import {
   Table,
   TableBody,
@@ -7,47 +8,46 @@ import {
   TableRow,
 } from "@/components/ui/table";
 
-export type LogEntry = {
-  trigger: string;
-  triggeredAt: string;
-  triggeredBy: string;
-  summary: string;
-  conclusion: string;
-  status: string;
-  sources: string[];
+export type TaskRun = {
+  id: string;
+  taskId: string;
+  taskPrompt: string;
+  status: "pending" | "calling" | "completed" | "failed" | "not_matched";
+  approvalStatus?: "not_required" | "pending" | "approved" | "rejected";
+  sender?: string;
+  subject?: string;
+  snippet?: string;
+  matchingEvidence?: string[];
+  callId?: string;
+  result?: unknown;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
-export const demoLogs: LogEntry[] = [
-  {
-    trigger: "New contact added",
-    triggeredAt: "Today, 4:42 PM",
-    triggeredBy: "Vansh",
-    summary: "Enriched a new contact and checked for an existing account match.",
-    conclusion: "Contact added to the founder outreach sequence.",
-    status: "Completed",
-    sources: ["HubSpot"],
-  },
-  {
-    trigger: "Weekly pipeline review",
-    triggeredAt: "Today, 9:00 AM",
-    triggeredBy: "Scheduled",
-    summary: "Reviewed 24 active contacts for stalled conversations and missing follow-ups.",
-    conclusion: "Five follow-ups were flagged for review.",
-    status: "Completed",
-    sources: ["Google Calendar"],
-  },
-  {
-    trigger: "High-intent reply",
-    triggeredAt: "Yesterday, 6:18 PM",
-    triggeredBy: "Kordy",
-    summary: "Analysed an inbound reply and gathered the relevant account context.",
-    conclusion: "Waiting for approval before drafting a response.",
-    status: "Needs review",
-    sources: ["Gmail"],
-  },
-];
+const dateFormatter = new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", timeStyle: "short" });
 
-export function LogsTable({ logs = demoLogs }: { logs?: LogEntry[] }) {
+function conclusion(run: TaskRun) {
+  if (run.error) return run.error;
+  if (typeof run.result === "string") return run.result;
+  if (run.result && typeof run.result === "object") return JSON.stringify(run.result);
+  if (run.status === "not_matched") return run.matchingEvidence?.[0] ?? "The email did not match this trigger.";
+  if (run.status === "calling") return "The call is in progress.";
+  if (run.status === "pending") return "Waiting to start the call.";
+  return "No call result was recorded.";
+}
+
+export function LogsTable({ runs, tasks }: { runs: TaskRun[]; tasks: Task[] }) {
+  const targets = new Map(tasks.map((task) => [task.id, task.action?.targetName ?? "Not resolved"]));
+
+  if (!runs.length) {
+    return (
+      <div className="rounded-xl border border-dashed p-10 text-center text-sm text-muted-foreground">
+        No trigger runs yet.
+      </div>
+    );
+  }
+
   return (
     <div className="overflow-hidden rounded-xl border bg-card">
       <Table>
@@ -55,7 +55,7 @@ export function LogsTable({ logs = demoLogs }: { logs?: LogEntry[] }) {
           <TableRow className="bg-muted/40 hover:bg-muted/40">
             <TableHead>Trigger</TableHead>
             <TableHead>Triggered</TableHead>
-            <TableHead>By</TableHead>
+            <TableHead>To</TableHead>
             <TableHead>Summary</TableHead>
             <TableHead>Conclusion</TableHead>
             <TableHead>Sources</TableHead>
@@ -63,27 +63,23 @@ export function LogsTable({ logs = demoLogs }: { logs?: LogEntry[] }) {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {logs.map((log) => (
-            <TableRow key={`${log.trigger}-${log.triggeredAt}`}>
-              <TableCell className="font-medium">{log.trigger}</TableCell>
-              <TableCell className="text-muted-foreground">{log.triggeredAt}</TableCell>
-              <TableCell>{log.triggeredBy}</TableCell>
-              <TableCell className="max-w-72 whitespace-normal text-muted-foreground">
-                {log.summary}
+          {runs.map((run) => (
+            <TableRow key={run.id}>
+              <TableCell className="max-w-64 whitespace-normal font-medium">{run.taskPrompt}</TableCell>
+              <TableCell className="text-muted-foreground">
+                <time dateTime={run.createdAt}>{dateFormatter.format(new Date(run.createdAt))}</time>
               </TableCell>
-              <TableCell className="max-w-64 whitespace-normal">{log.conclusion}</TableCell>
+              <TableCell>{targets.get(run.taskId) ?? "You"}</TableCell>
+              <TableCell className="max-w-72 whitespace-normal text-muted-foreground">
+                {[run.sender, run.subject, run.snippet].filter(Boolean).join(" · ") || "Gmail event received"}
+              </TableCell>
+              <TableCell className="max-w-64 whitespace-normal">{conclusion(run)}</TableCell>
               <TableCell>
-                <div className="flex gap-1">
-                  {log.sources.map((source) => (
-                    <span key={source} className="rounded-md bg-muted px-2 py-1 text-xs">
-                      {source}
-                    </span>
-                  ))}
-                </div>
+                <span className="rounded-md bg-muted px-2 py-1 text-xs">Gmail</span>
               </TableCell>
               <TableCell>
                 <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium">
-                  {log.status}
+                  {run.status.replaceAll("_", " ")}
                 </span>
               </TableCell>
             </TableRow>

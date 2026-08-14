@@ -5,6 +5,8 @@
   "scripts": {
     "db:up": "docker compose up -d --wait",
     "dev": "bun run --filter '*' dev",
+    "worker": "bun run --cwd apps/api worker",
+    "gmail:tunnel": "bun run --cwd apps/api gmail:tunnel",
     "build": "bun run --filter '*' build",
     "lint": "bun run --cwd apps/web lint",
     "typecheck": "bun run --filter '*' typecheck"

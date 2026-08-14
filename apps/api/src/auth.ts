@@ -1,24 +1,25 @@
 // Google OAuth authorization-code flow and signed cookie sessions.
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Context } from "hono";
+import { upsertUser } from "./db";
 
 const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
-type Session = { sub: string; email?: string; name?: string; picture?: string; exp: number };
+export type Session = { sub: string; email?: string; name?: string; picture?: string; exp: number };
 const env = () => ({ clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET, redirectUri: process.env.GOOGLE_REDIRECT_URI ?? "http://localhost:3007/auth/google/callback", sessionSecret: process.env.SESSION_SECRET, webUrl: process.env.WEB_URL ?? "http://localhost:3006/home" });
-const cookieValue = (cookie: string | undefined, name: string) => cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
+export const cookieValue = (cookie: string | undefined, name: string) => cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
 const encode = (value: string) => Buffer.from(value).toString("base64url");
 const decode = (value: string) => Buffer.from(value, "base64url").toString("utf8");
 const sign = (value: string, secret: string) => createHmac("sha256", secret).update(value).digest("base64url");
-const cookie = (name: string, value: string, maxAge: number) => `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`;
+export const sessionCookie = (name: string, value: string, maxAge: number) => `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`;
 const required = (values: Record<string, string | undefined>) => { const missing = Object.entries(values).filter(([, value]) => !value).map(([key]) => key); if (missing.length) throw new Error(`Missing OAuth configuration: ${missing.join(", ")}`); };
 
 export function startGoogleAuth(c: Context) {
   const config = env(); required({ GOOGLE_CLIENT_ID: config.clientId, SESSION_SECRET: config.sessionSecret });
   const state = randomBytes(24).toString("base64url");
   const url = new URL(GOOGLE_AUTH_URL); url.search = new URLSearchParams({ client_id: config.clientId!, redirect_uri: config.redirectUri, response_type: "code", scope: "openid email profile", state }).toString();
-  c.header("Set-Cookie", cookie("oauth_state", state, 600)); return c.redirect(url.toString());
+  c.header("Set-Cookie", sessionCookie("oauth_state", state, 600)); return c.redirect(url.toString());
 }
 
 export async function finishGoogleAuth(c: Context) {
@@ -32,8 +33,9 @@ export async function finishGoogleAuth(c: Context) {
   const userResponse = await fetch(GOOGLE_USERINFO_URL, { headers: { Authorization: `Bearer ${token.access_token}` } });
   if (!userResponse.ok) return c.text(`Google profile lookup failed: ${await userResponse.text()}`, 502);
   const user = (await userResponse.json()) as { sub?: string; email?: string; name?: string; picture?: string }; if (!user.sub) return c.text("Google profile did not include a subject", 502);
+  await upsertUser({ sub: user.sub, email: user.email, name: user.name, picture: user.picture });
   const payload = encode(JSON.stringify({ sub: user.sub, email: user.email, name: user.name, picture: user.picture, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 } satisfies Session));
-  c.header("Set-Cookie", cookie("kyub_session", `${payload}.${sign(payload, config.sessionSecret!)}`, 60 * 60 * 24 * 7)); return c.redirect(config.webUrl);
+  c.header("Set-Cookie", sessionCookie("kyub_session", `${payload}.${sign(payload, config.sessionSecret!)}`, 60 * 60 * 24 * 7)); return c.redirect(config.webUrl);
 }
 
 export function currentSession(c: Context) {
@@ -42,4 +44,4 @@ export function currentSession(c: Context) {
   const session = JSON.parse(decode(payload)) as Session; return session.exp > Math.floor(Date.now() / 1000) ? session : null;
 }
 
-export function clearSession(c: Context) { c.header("Set-Cookie", cookie("kyub_session", "", 0)); return c.json({ ok: true }); }
+export function clearSession(c: Context) { c.header("Set-Cookie", sessionCookie("kyub_session", "", 0)); return c.json({ ok: true }); }
