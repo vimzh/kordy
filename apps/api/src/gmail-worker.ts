@@ -52,6 +52,7 @@ export interface WorkerDependencies {
   listActiveTasks(connectionId: string): Promise<WorkerTask[]>;
   persistMessage(connectionId: string, message: ParsedGmailMessage): Promise<void>;
   loadRunDecision(input: { eventId: string; taskId: string; messageId: string }): Promise<WorkerMatchDecision | null>;
+  canDispatchCall(task: WorkerTask): Promise<boolean>;
   matchTask(task: WorkerTask, message: ParsedGmailMessage): Promise<WorkerMatchDecision>;
   // Atomically create the unique task/message run or resume it when retryable; return null for complete, terminal, or already-claimed runs.
   claimRun(input: { eventId: string; taskId: string; messageId: string; decision: WorkerMatchDecision; requiresApproval: boolean }): Promise<WorkerRun | null>;
@@ -104,6 +105,15 @@ class WorkerRetryError extends Error {
   }
 }
 
+export function passesGmailRuleFilter(task: WorkerTask, message: ParsedGmailMessage) {
+  const sender = (message.sender.match(/<([^>]+)>/)?.[1] ?? message.sender).trim().toLowerCase();
+  const includesAll = (value: string, needles: string[]) => needles.every((needle) => value.toLowerCase().includes(needle.toLowerCase()));
+  return (!task.senders?.length || task.senders.some((value) => value.toLowerCase() === sender))
+    && includesAll(message.subject, task.subjectKeywords ?? [])
+    && includesAll(`${message.snippet ?? ""}\n${message.body}`, task.bodyKeywords ?? [])
+    && (task.labels ?? []).every((label) => message.labelIds.includes(label));
+}
+
 async function processMessage(
   deps: WorkerDependencies,
   event: SourceEvent,
@@ -115,8 +125,13 @@ async function processMessage(
   await deps.persistMessage(connection.id, message);
   for (const task of tasks) {
     if (task.activationAt && message.receivedAt && new Date(message.receivedAt) < new Date(task.activationAt)) continue;
-    const decision = await deps.loadRunDecision({ eventId: event.id, taskId: task.id, messageId: message.id })
-      ?? await deps.matchTask(task, message);
+    const existingDecision = await deps.loadRunDecision({ eventId: event.id, taskId: task.id, messageId: message.id });
+    const passesRules = passesGmailRuleFilter(task, message);
+    const decision = existingDecision ?? (!passesRules
+      ? { matches: false, confidence: "high" as const, reason: "The email failed an explicit sender, keyword, or label rule." }
+      : !await deps.canDispatchCall(task)
+        ? { matches: false, confidence: "high" as const, reason: "The event was skipped because the daily call budget is exhausted." }
+        : await deps.matchTask(task, message));
     const run = await deps.claimRun({ eventId: event.id, taskId: task.id, messageId: message.id, decision, requiresApproval: task.executionMode === "approval" });
     if (!run || run.awaitingApproval) continue;
     try {

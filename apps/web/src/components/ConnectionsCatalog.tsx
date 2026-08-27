@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { MessageSquare, Plus, Search } from "lucide-react";
+import { MessageSquare, Plus, Search, Workflow } from "lucide-react";
 import {
   SiAirtable,
   SiAsana,
@@ -26,15 +26,16 @@ import {
 import { ConnectionCard } from "@/components/ConnectionCard";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { WebhookConnectionDialog } from "@/components/WebhookConnectionDialog";
 
 const connections = [
   { name: "Gmail", description: "Read and send email through your Google account.", icon: SiGmail },
   { name: "Vercel", description: "Access projects, deployments, and build activity.", icon: SiVercel },
   { name: "Slack", description: "Work with channels, messages, and team activity.", icon: MessageSquare },
-  { name: "GitHub", description: "Connect repositories, issues, and pull requests.", icon: SiGithub },
+  { name: "GitHub", description: "Watch repository, issue, pull request, and workflow events.", icon: SiGithub },
   { name: "Notion", description: "Search and update pages, databases, and workspace content.", icon: SiNotion },
   { name: "Google Drive", description: "Find and manage files across Google Drive.", icon: SiGoogledrive },
-  { name: "Google Calendar", description: "View schedules and create calendar events.", icon: SiGooglecalendar },
+  { name: "Google Calendar", description: "Watch upcoming events in your primary calendar.", icon: SiGooglecalendar },
   { name: "Dropbox", description: "Access shared files and folders in Dropbox.", icon: SiDropbox },
   { name: "HubSpot", description: "Work with contacts, companies, and sales activity.", icon: SiHubspot },
   { name: "Linear", description: "Create and track product issues and projects.", icon: SiLinear },
@@ -42,7 +43,8 @@ const connections = [
   { name: "Trello", description: "Read and update boards, lists, and cards.", icon: SiTrello },
   { name: "Discord", description: "Connect server channels and community messages.", icon: SiDiscord },
   { name: "Zoom", description: "Access meetings, recordings, and call details.", icon: SiZoom },
-  { name: "Stripe", description: "Review customers, payments, and subscriptions.", icon: SiStripe },
+  { name: "Stripe", description: "Watch payment, subscription, and dispute events.", icon: SiStripe },
+  { name: "n8n", description: "Receive events from your existing n8n workflows.", icon: Workflow },
   { name: "Shopify", description: "Connect products, orders, and store operations.", icon: SiShopify },
   { name: "Airtable", description: "Read and update records in Airtable bases.", icon: SiAirtable },
   { name: "Asana", description: "Manage projects, tasks, and team assignments.", icon: SiAsana },
@@ -74,6 +76,9 @@ type NotionConnection = {
 };
 
 type ConnectionFilter = "all" | "connected" | "unconnected";
+type IntegrationProvider = "github" | "stripe" | "google_calendar" | "n8n";
+type IntegrationConnection = { id: string; provider: IntegrationProvider; label: string; status: "connected" | "needs_reconnect" | "disconnected"; webhookUrl?: string };
+const integrationNames: Record<IntegrationProvider, string> = { github: "GitHub", stripe: "Stripe", google_calendar: "Google Calendar", n8n: "n8n" };
 
 const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
 
@@ -83,6 +88,8 @@ export function ConnectionsCatalog() {
   const [gmailConnections, setGmailConnections] = useState<GmailConnection[]>([]);
   const [vercelConnections, setVercelConnections] = useState<VercelConnection[]>([]);
   const [notionConnections, setNotionConnections] = useState<NotionConnection[]>([]);
+  const [integrationConnections, setIntegrationConnections] = useState<IntegrationConnection[]>([]);
+  const [setupProvider, setSetupProvider] = useState<"github" | "stripe" | "n8n" | null>(null);
   const [loading, setLoading] = useState(true);
   const [disconnectingId, setDisconnectingId] = useState<string | null>(null);
   const [error, setError] = useState("");
@@ -92,10 +99,12 @@ export function ConnectionsCatalog() {
       || (connection.name === "Gmail" && gmailConnections.some((gmail) => gmail.email.toLowerCase().includes(normalizedQuery)))
       || (connection.name === "Vercel" && vercelConnections.some((vercel) => `${vercel.name} ${vercel.slug}`.toLowerCase().includes(normalizedQuery)))
       || (connection.name === "Notion" && notionConnections.some((notion) => notion.name.toLowerCase().includes(normalizedQuery)));
+    const integrationProvider = (Object.entries(integrationNames).find(([, name]) => name === connection.name)?.[0] ?? null) as IntegrationProvider | null;
     const hasConnection = connection.name === "Gmail"
       ? gmailConnections.some((item) => item.status === "connected")
       : connection.name === "Vercel" ? vercelConnections.some((item) => item.status === "connected")
-        : connection.name === "Notion" ? notionConnections.some((item) => item.status === "connected") : false;
+        : connection.name === "Notion" ? notionConnections.some((item) => item.status === "connected")
+          : integrationProvider ? integrationConnections.some((item) => item.provider === integrationProvider && item.status === "connected") : false;
     return matchesQuery && (connectionFilter === "all" || (connectionFilter === "connected" ? hasConnection : !hasConnection));
   });
 
@@ -104,15 +113,17 @@ export function ConnectionsCatalog() {
 
     async function loadConnections() {
       try {
-        const [gmailResponse, vercelResponse, notionResponse] = await Promise.all([
+        const [gmailResponse, vercelResponse, notionResponse, integrationResponse] = await Promise.all([
           fetch(`${apiUrl}/connections/gmail`, { credentials: "include" }),
           fetch(`${apiUrl}/connections/vercel`, { credentials: "include" }),
           fetch(`${apiUrl}/connections/notion`, { credentials: "include" }),
+          fetch(`${apiUrl}/connections/integrations`, { credentials: "include" }),
         ]);
-        const [gmailResult, vercelResult, notionResult] = await Promise.all([
+        const [gmailResult, vercelResult, notionResult, integrationResult] = await Promise.all([
           gmailResponse.json().catch(() => null) as Promise<{ connections?: GmailConnection[]; error?: string } | null>,
           vercelResponse.json().catch(() => null) as Promise<{ connections?: VercelConnection[]; error?: string } | null>,
           notionResponse.json().catch(() => null) as Promise<{ connections?: NotionConnection[]; error?: string } | null>,
+          integrationResponse.json().catch(() => null) as Promise<{ connections?: IntegrationConnection[]; error?: string } | null>,
         ]);
         if (!gmailResponse.ok || !gmailResult || !("connections" in gmailResult)) {
           throw new Error(gmailResult?.error ?? "Could not load Gmail connections");
@@ -123,10 +134,12 @@ export function ConnectionsCatalog() {
         if (!notionResponse.ok || !notionResult || !("connections" in notionResult)) {
           throw new Error(notionResult?.error ?? "Could not load Notion connections");
         }
+        if (!integrationResponse.ok || !integrationResult || !("connections" in integrationResult)) throw new Error(integrationResult?.error ?? "Could not load integrations");
         if (active) {
           setGmailConnections(gmailResult.connections ?? []);
           setVercelConnections(vercelResult.connections ?? []);
           setNotionConnections(notionResult.connections ?? []);
+          setIntegrationConnections(integrationResult.connections ?? []);
         }
       } catch (caught) {
         if (active) setError(caught instanceof Error ? caught.message : "Could not load connections");
@@ -184,6 +197,21 @@ export function ConnectionsCatalog() {
       if (result?.warning) setError(result.warning);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not disconnect Notion");
+    } finally {
+      setDisconnectingId(null);
+    }
+  }
+
+  async function disconnectIntegration(id: string) {
+    setDisconnectingId(id);
+    setError("");
+    try {
+      const response = await fetch(`${apiUrl}/connections/integrations/${id}`, { method: "DELETE", credentials: "include" });
+      const result = await response.json().catch(() => null) as { error?: string } | null;
+      if (!response.ok) throw new Error(result?.error ?? "Could not disconnect integration");
+      setIntegrationConnections((current) => current.filter((connection) => connection.id !== id));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "Could not disconnect integration");
     } finally {
       setDisconnectingId(null);
     }
@@ -275,6 +303,12 @@ export function ConnectionsCatalog() {
                 ] : []),
               ];
             }
+            const integrationProvider = (Object.entries(integrationNames).find(([, name]) => name === connection.name)?.[0] ?? null) as IntegrationProvider | null;
+            if (integrationProvider) {
+              const connected = integrationConnections.find((item) => item.provider === integrationProvider);
+              if (connected) return <ConnectionCard key={connected.id} {...connection} status={connected.status} detail={connected.label} busy={loading || disconnectingId === connected.id} connectHref={integrationProvider === "google_calendar" && connected.status === "needs_reconnect" ? `${apiUrl}/connections/google-calendar/start` : undefined} onDisconnect={() => void disconnectIntegration(connected.id)} />;
+              return <ConnectionCard key={connection.name} {...connection} status="disconnected" busy={loading} connectHref={integrationProvider === "google_calendar" ? `${apiUrl}/connections/google-calendar/start` : undefined} onConnect={integrationProvider === "google_calendar" ? undefined : () => setSetupProvider(integrationProvider)} />;
+            }
             if (connection.name !== "Gmail") return <ConnectionCard key={connection.name} {...connection} />;
             const gmailCards = gmailConnections.filter((gmail) => connectionFilter === "all" || (connectionFilter === "connected" ? gmail.status === "connected" : gmail.status !== "connected")).map((gmail) => (
               <ConnectionCard
@@ -307,6 +341,7 @@ export function ConnectionsCatalog() {
           No connections match these filters.
         </div>
       )}
+      <WebhookConnectionDialog provider={setupProvider} onClose={() => setSetupProvider(null)} onCreated={(connection) => setIntegrationConnections((current) => [...current.filter((item) => item.provider !== connection.provider), connection])} />
     </div>
   );
 }

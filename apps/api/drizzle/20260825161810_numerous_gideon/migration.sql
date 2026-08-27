@@ -1,0 +1,3 @@
+ALTER TABLE "tasks" ADD COLUMN "public_source_state" jsonb;--> statement-breakpoint
+ALTER TABLE "tasks" ADD COLUMN "last_polled_at" timestamp with time zone;--> statement-breakpoint
+ALTER TABLE "source_events" DROP CONSTRAINT "source_events_kind_check", ADD CONSTRAINT "source_events_kind_check" CHECK ("kind" in ('gmail.notification', 'gmail.message', 'vercel.deployment.failed', 'notion.page.updated', 'public.signal'));

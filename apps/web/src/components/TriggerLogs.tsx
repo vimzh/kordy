@@ -22,7 +22,7 @@ export function TriggerLogs({ contacts }: { contacts: Contact[] }) {
     let polling = false;
 
     async function poll() {
-      if (polling) return;
+      if (polling || document.visibilityState === "hidden") return;
       polling = true;
       try {
         const [runsResponse, tasksResponse] = await Promise.all([
@@ -49,10 +49,13 @@ export function TriggerLogs({ contacts }: { contacts: Contact[] }) {
     }
 
     void poll();
-    const interval = window.setInterval(() => void poll(), 5_000);
+    const interval = window.setInterval(() => void poll(), 30_000);
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") void poll(); };
+    document.addEventListener("visibilitychange", onVisibilityChange);
     return () => {
       active = false;
       window.clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
 

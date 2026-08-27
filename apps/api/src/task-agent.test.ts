@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { buildTaskAgentPrompt, taskAgentModels, taskAgentOutput, taskNeedsComplexModel, taskPromptSchema, validateTaskResult, type TaskAgentContext } from './task-agent'
+import { buildTaskAgentPrompt, taskAgentModels, taskAgentOutput, taskNeedsComplexModel, taskPromptSchema, taskTriggerFromResult, validateTaskResult, type TaskAgentContext } from './task-agent'
 
 const context: TaskAgentContext = {
   currentUser: {
@@ -23,6 +23,7 @@ const context: TaskAgentContext = {
     workspaceName: null,
     pages: [],
   },
+  integration: { connected: false, provider: null, label: null },
   contacts: [{
     id: 'contact-1',
     name: 'Aarav Mehta',
@@ -85,6 +86,37 @@ describe('task plan validation', () => {
     expect(validateTaskResult(notionPlan, notionContext)).toEqual(notionPlan)
   })
 
+  test('accepts a connected GitHub webhook plan', () => {
+    const githubPlan = {
+      status: 'complete' as const,
+      trigger: { source: 'github' as const, event: 'integration.event' as const, rules: { eventNames: ['workflow_run.completed'], keywords: ['failure'], withinMinutes: 0 } },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain the failed GitHub workflow.' },
+    }
+    const githubContext = { ...context, integration: { connected: true, provider: 'github' as const, label: 'GitHub webhook' } }
+    expect(validateTaskResult(githubPlan, githubContext)).toEqual(githubPlan)
+    expect(taskTriggerFromResult(githubPlan, githubContext)).toEqual({ type: 'integration.event', provider: 'github', ...githubPlan.trigger.rules })
+  })
+
+  test('accepts public sources without a connected account', () => {
+    const weatherPlan = {
+      status: 'complete' as const,
+      trigger: { source: 'weather' as const, event: 'rain.forecast' as const, rules: { location: 'Bengaluru', latitude: 12.9716, longitude: 77.5946, minimumPrecipitationMm: 1, withinHours: 24, consecutiveHours: 1 } },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain the incoming rain forecast.' },
+    }
+    expect(validateTaskResult(weatherPlan, context)).toEqual(weatherPlan)
+    expect(taskTriggerFromResult(weatherPlan, context)).toEqual({ type: 'weather.rain_forecast', ...weatherPlan.trigger.rules })
+  })
+
+  test('accepts Indian stock activity without a brokerage connection', () => {
+    const stockPlan = {
+      status: 'complete' as const,
+      trigger: { source: 'india' as const, event: 'stock.activity' as const, rules: { activity: 'daily_move' as const, symbol: 'RELIANCE', companyName: 'Reliance Industries', exchange: 'NSE' as const, direction: 'loss' as const, percent: 5 } },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain the Reliance daily loss.' },
+    }
+    expect(validateTaskResult(stockPlan, context)).toEqual(stockPlan)
+    expect(taskTriggerFromResult(stockPlan, context)).toEqual({ type: 'india.stock.daily_move', symbol: 'RELIANCE', companyName: 'Reliance Industries', exchange: 'NSE', direction: 'loss', percent: 5 })
+  })
+
   test('rejects unsupported output and unresolved context values', () => {
     expect(taskPromptSchema.safeParse({ ...complete, trigger: { ...complete.trigger, event: 'email.sent' } }).success).toBe(false)
     expect(() => validateTaskResult({ ...complete, action: { ...complete.action, target: { type: 'contact', contactId: 'missing' } } }, context)).toThrow('valid phone')
@@ -102,6 +134,7 @@ test('builds a prompt with the literal request and bounded resolver scope', asyn
   const format = await taskAgentOutput.responseFormat
   if (!format || format.type !== 'json') throw new Error('Expected JSON output format')
   expect(format.schema).toMatchObject({ type: 'object' })
+  expect(JSON.stringify(format.schema)).not.toContain('(?')
 })
 
 test('treats prompt injection as literal request data', () => {

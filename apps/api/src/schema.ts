@@ -89,6 +89,22 @@ export const notionConnections = pgTable("notion_connections", {
   check("notion_connections_status_check", sql`${table.status} in ('connected', 'needs_reconnect', 'disconnected')`),
 ]);
 
+export const integrationConnections = pgTable("integration_connections", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  provider: text("provider").$type<"github" | "stripe" | "google_calendar" | "n8n">().notNull(),
+  label: text("label").notNull(),
+  encryptedCredential: text("encrypted_credential").notNull(),
+  metadata: jsonb("metadata").$type<Record<string, unknown>>().default({}).notNull(),
+  status: text("status").$type<"connected" | "needs_reconnect" | "disconnected">().notNull(),
+  lastPolledAt: timestamp("last_polled_at", { withTimezone: true, mode: "string" }).defaultNow().notNull(),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("integration_connections_user_provider_key").on(table.userId, table.provider),
+  check("integration_connections_provider_check", sql`${table.provider} in ('github', 'stripe', 'google_calendar', 'n8n')`),
+  check("integration_connections_status_check", sql`${table.status} in ('connected', 'needs_reconnect', 'disconnected')`),
+]);
+
 export const tasks = pgTable("tasks", {
   id: text("id").primaryKey(),
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
@@ -99,8 +115,11 @@ export const tasks = pgTable("tasks", {
   gmailConnectionId: text("gmail_connection_id").references(() => gmailConnections.id, { onDelete: "set null" }),
   vercelConnectionId: text("vercel_connection_id").references(() => vercelConnections.id, { onDelete: "set null" }),
   notionConnectionId: text("notion_connection_id").references(() => notionConnections.id, { onDelete: "set null" }),
+  integrationConnectionId: text("integration_connection_id").references(() => integrationConnections.id, { onDelete: "set null" }),
   trigger: jsonb("trigger"),
   action: jsonb("action"),
+  publicSourceState: jsonb("public_source_state").$type<{ matched: boolean; fingerprint: string }>(),
+  lastPolledAt: timestamp("last_polled_at", { withTimezone: true, mode: "string" }),
   clarificationQuestion: text("clarification_question"),
   clarificationContext: jsonb("clarification_context"),
   parserModel: text("parser_model").notNull(),
@@ -118,7 +137,8 @@ export const sourceEvents = pgTable("source_events", {
   gmailConnectionId: text("gmail_connection_id").references(() => gmailConnections.id, { onDelete: "cascade" }),
   vercelConnectionId: text("vercel_connection_id").references(() => vercelConnections.id, { onDelete: "cascade" }),
   notionConnectionId: text("notion_connection_id").references(() => notionConnections.id, { onDelete: "cascade" }),
-  kind: text("kind").$type<"gmail.notification" | "gmail.message" | "vercel.deployment.failed" | "notion.page.updated">().notNull(),
+  integrationConnectionId: text("integration_connection_id").references(() => integrationConnections.id, { onDelete: "cascade" }),
+  kind: text("kind").$type<"gmail.notification" | "gmail.message" | "vercel.deployment.failed" | "notion.page.updated" | "public.signal" | "integration.event">().notNull(),
   pubsubMessageId: text("pubsub_message_id"),
   gmailMessageId: text("gmail_message_id"),
   gmailThreadId: text("gmail_thread_id"),
@@ -136,6 +156,9 @@ export const sourceEvents = pgTable("source_events", {
     pageId?: string;
     pageTitle?: string;
     pageUrl?: string;
+    provider?: string;
+    signal?: string;
+    eventName?: string;
   }>(),
   snippet: text("snippet"),
   occurredAt: timestamp("occurred_at", { withTimezone: true, mode: "string" }),
@@ -146,7 +169,7 @@ export const sourceEvents = pgTable("source_events", {
   ...timestamps,
 }, (table) => [
   index("source_events_queue_idx").on(table.processingState, table.availableAt),
-  check("source_events_kind_check", sql`${table.kind} in ('gmail.notification', 'gmail.message', 'vercel.deployment.failed', 'notion.page.updated')`),
+  check("source_events_kind_check", sql`${table.kind} in ('gmail.notification', 'gmail.message', 'vercel.deployment.failed', 'notion.page.updated', 'public.signal', 'integration.event')`),
   check("source_events_processing_state_check", sql`${table.processingState} in ('pending', 'processing', 'completed', 'failed')`),
 ]);
 
@@ -183,4 +206,12 @@ export const callTasks = pgTable("call_tasks", {
   ...timestamps,
 }, (table) => [
   uniqueIndex("call_tasks_run_key").on(table.taskRunId).where(sql`${table.taskRunId} is not null`),
+]);
+
+export const callDispatchReservations = pgTable("call_dispatch_reservations", {
+  eventKey: text("event_key").primaryKey(),
+  userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  createdAt: timestamps.createdAt,
+}, (table) => [
+  index("call_dispatch_reservations_user_created_idx").on(table.userId, table.createdAt),
 ]);

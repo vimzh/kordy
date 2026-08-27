@@ -201,8 +201,10 @@ export async function listHistory(accessToken: string, startHistoryId: string) {
   const seen = new Set<string>();
   let pageToken: string | undefined;
   let historyId = startHistoryId;
+  let pages = 0;
 
   do {
+    if (pages++ >= 10) throw new Error("Gmail history exceeded the 10-page safety bound; reconnect to reset the cursor");
     const query = new URLSearchParams({ startHistoryId, historyTypes: "messageAdded", labelId: "INBOX", maxResults: "500" });
     if (pageToken) query.set("pageToken", pageToken);
     const page = await gmail<{
@@ -219,6 +221,7 @@ export async function listHistory(accessToken: string, startHistoryId: string) {
         }
       }
     }
+    if (messageIds.length >= 500 && page.nextPageToken) throw new Error("Gmail history exceeded the 500-message safety bound; reconnect to reset the cursor");
     pageToken = page.nextPageToken;
     if (page.historyId) historyId = page.historyId;
   } while (pageToken);

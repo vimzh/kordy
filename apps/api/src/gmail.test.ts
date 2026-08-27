@@ -86,3 +86,37 @@ test("paginates history and de-duplicates added messages", async () => {
   }
   expect(requests).toHaveLength(2);
 });
+
+test("stops runaway Gmail history pagination after ten pages", async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async (_input) => {
+    requests += 1;
+    return Response.json({ nextPageToken: `page-${requests}`, historyId: String(requests) });
+  }) as typeof fetch;
+  try {
+    await expect(listHistory("access-token", "10")).rejects.toThrow("10-page safety bound");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  expect(requests).toBe(10);
+});
+
+test("stops Gmail history before fetching more than five hundred messages", async () => {
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async (_input) => {
+    requests += 1;
+    return Response.json({
+      history: [{ messagesAdded: Array.from({ length: 500 }, (_, index) => ({ message: { id: `message-${index}` } })) }],
+      nextPageToken: "more",
+      historyId: "11",
+    });
+  }) as typeof fetch;
+  try {
+    await expect(listHistory("access-token", "10")).rejects.toThrow("500-message safety bound");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  expect(requests).toBe(1);
+});

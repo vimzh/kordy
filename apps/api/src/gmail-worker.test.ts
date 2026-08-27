@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { GmailApiError } from "./gmail";
 import {
   callRetryAt,
+  passesGmailRuleFilter,
   retryDelayMs,
   retryDisposition,
   runWorkerOnce,
@@ -9,6 +10,14 @@ import {
   type WorkerConnection,
   type WorkerDependencies,
 } from "./gmail-worker";
+
+test("rejects explicit Gmail rule mismatches before spending a model call", () => {
+  const task = { id: "task-1", userId: "user-1", originalPrompt: "Call me", instruction: "Call me", phone: "+12025550123", senders: ["alice@example.com"], subjectKeywords: ["invoice"], bodyKeywords: ["overdue"], labels: ["IMPORTANT"] };
+  const matching = { id: "message-1", sender: "Alice <alice@example.com>", subject: "Invoice notice", snippet: "Now overdue", body: "", labelIds: ["IMPORTANT"] };
+  expect(passesGmailRuleFilter(task, matching)).toBe(true);
+  expect(passesGmailRuleFilter(task, { ...matching, sender: "bob@example.com" })).toBe(false);
+  expect(passesGmailRuleFilter(task, { ...matching, labelIds: [] })).toBe(false);
+});
 
 const connection: WorkerConnection = {
   id: "connection-1",
@@ -27,6 +36,7 @@ function dependencies(overrides: Partial<WorkerDependencies> = {}): WorkerDepend
     listActiveTasks: async () => [],
     persistMessage: async () => {},
     loadRunDecision: async () => null,
+    canDispatchCall: async () => true,
     matchTask: async () => ({ matches: true, confidence: "high", reason: "The email matches the saved trigger." }),
     claimRun: async () => null,
     dispatchCall: async () => ({ id: "call-1" }),

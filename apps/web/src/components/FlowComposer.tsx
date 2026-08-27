@@ -8,11 +8,11 @@ import type { Contact } from "@/components/ContactsTable";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-const sources = ["Gmail", "Notion", "Slack", "GitHub", "Google Calendar", "Vercel", "PostgreSQL"];
+const sources = ["Gmail", "Notion", "Vercel", "GitHub", "Stripe", "Google Calendar", "n8n", "Weather", "SEC", "USGS", "NASA EONET", "Foreign Exchange", "Indian stocks (EOD)"];
 const examples = [
-  "Call me when @Aarav emails me on Gmail",
-  "Call me when production goes down",
-  "Call @Maya when a deployment fails",
+  "Call me when rain is forecast in Bengaluru",
+  "Call me when Apple files an 8-K",
+  "Call me when RELIANCE on NSE closes above ₹1,500",
 ];
 const utilityButtonClass = "w-32";
 
@@ -21,6 +21,7 @@ export type Task = {
   originalPrompt: string;
   gmailConnectionId?: string | null;
   notionConnectionId?: string | null;
+  integrationConnectionId?: string | null;
   status: "creating" | "parsing" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed";
   trigger: {
     type: "email.received";
@@ -39,6 +40,63 @@ export type Task = {
     pageIds: string[];
     pageTitles: string[];
     keywords: string[];
+  } | {
+    type: "integration.event";
+    provider: "github" | "stripe" | "google_calendar" | "n8n";
+    eventNames: string[];
+    keywords: string[];
+    withinMinutes: number;
+  } | {
+    type: "weather.rain_forecast";
+    location: string;
+    latitude: number;
+    longitude: number;
+    minimumPrecipitationMm: number;
+    withinHours: number;
+    consecutiveHours: number;
+  } | {
+    type: "sec.filing.published";
+    cik: string;
+    companyName: string;
+    forms: string[];
+  } | {
+    type: "usgs.earthquake.detected";
+    location: string;
+    latitude: number;
+    longitude: number;
+    radiusKm: number;
+    minimumMagnitude: number;
+  } | {
+    type: "nasa.event.opened";
+    categories: string[];
+    location: string;
+    bbox: [number, number, number, number] | [];
+  } | {
+    type: "fx.rate.threshold";
+    base: string;
+    quote: string;
+    operator: "above" | "below";
+    threshold: number;
+  } | {
+    type: "india.stock.price_threshold";
+    symbol: string;
+    companyName: string;
+    exchange: "NSE" | "BSE";
+    operator: "above" | "below";
+    price: number;
+  } | {
+    type: "india.stock.daily_move";
+    symbol: string;
+    companyName: string;
+    exchange: "NSE" | "BSE";
+    direction: "gain" | "loss";
+    percent: number;
+  } | {
+    type: "india.stock.volume_threshold";
+    symbol: string;
+    companyName: string;
+    exchange: "NSE" | "BSE";
+    minimumVolume: number;
   } | null;
   action: {
     type: "calle.call";
@@ -219,6 +277,7 @@ export function FlowComposer({
     setSelectedSources([]);
     setSelectedGmailConnectionId(gmailConnections.length === 1 ? gmailConnections[0]!.id : "");
     setSelectedVercelConnectionId(vercelConnections.length === 1 ? vercelConnections[0]!.id : "");
+    setSelectedNotionConnectionId(notionConnections.length === 1 ? notionConnections[0]!.id : "");
     setAttachments([]);
     setClarification(null);
     setClarificationAnswer("");
@@ -270,8 +329,8 @@ export function FlowComposer({
         | { status?: string; task?: Task; taskId?: string; question?: string; error?: string; connection?: string; connections?: Array<GmailConnection | VercelConnection | NotionConnection> }
         | null;
 
-      if (response.status === 409 && result && "status" in result && result.status === "connection_required" && (result.connection === "gmail" || result.connection === "vercel" || result.connection === "notion")) {
-        window.open(`${apiUrl}/connections/${result.connection}/start`, "_self");
+      if (response.status === 409 && result && "status" in result && result.status === "connection_required") {
+        window.open(result.connection === "google_calendar" ? `${apiUrl}/connections/google-calendar/start` : result.connection === "gmail" || result.connection === "vercel" || result.connection === "notion" ? `${apiUrl}/connections/${result.connection}/start` : "/connections", "_self");
         return;
       }
       if (response.status === 409 && result && "status" in result && result.status === "connection_selection_required") {

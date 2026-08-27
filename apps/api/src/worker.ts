@@ -1,19 +1,22 @@
 // Separate durable worker that turns queued Gmail notifications into idempotent CALL-E calls.
-import { confirmedReplyInstruction, createCalleCall, normalizePhone } from "./calle";
+import { confirmedReplyInstruction, normalizePhone } from "./calle";
+import { dispatchCalleCall as createCalleCall, hasCalleCallCapacity } from "./call-dispatch";
 import {
-  advanceSourceEvent, claimNotionConnectionForPolling, claimNotionTaskRun, claimSourceEvent, claimTaskCreation, claimTaskRun, claimVercelConnectionForPolling, claimVercelTaskRun, completeNotionPoll, completeTaskCreation, completeVercelPoll, failTaskCreation, getGmailConnectionById, getTaskContext, getTaskRunDecision, initializeDatabase,
+  advanceSourceEvent, claimCalendarConnectionForPolling, claimIntegrationSourceEvent, claimIntegrationTaskRun, claimNotionConnectionForPolling, claimNotionTaskRun, claimPublicTaskForPolling, claimSourceEvent, claimTaskCreation, claimTaskRun, claimVercelConnectionForPolling, claimVercelTaskRun, completeNotionPoll, completeTaskCreation, completeVercelPoll, failTaskCreation, getGmailConnectionById, getTaskContext, getTaskRunDecision, initializeDatabase,
   claimApprovedTaskRun, claimPendingEmailReply, listActiveWorkerTasks, listGmailConnectionsNeedingWatchRenewal, markEmailReplyFailed, markEmailReplySent, markGmailReconnect,
-  listActiveNotionTasks, listActiveVercelTasks, markNotionReconnect, markTaskRunDispatched, markTaskRunFailed, markVercelReconnect, persistGmailMessage, persistNotionPage, persistVercelDeployment, saveCallTask, saveGmailConnection,
-  updateGmailCursor, updateGmailWatchExpiration,
+  listActiveIntegrationTasks, listActiveNotionTasks, listActiveVercelTasks, markIntegrationReconnect, markNotionReconnect, markTaskRunDispatched, markTaskRunFailed, markVercelReconnect, persistGmailMessage, persistNotionPage, persistVercelDeployment, recordCalendarTaskEvent, recordPublicSignal, saveCallTask, saveGmailConnection,
+  updateGmailCursor, updateGmailWatchExpiration, updateIntegrationMetadata,
 } from "./db";
 import { generateConfirmedEmailReply, generateNotionTaskContext, generateTaskContext, generateVercelTaskContext, matchGmailMessage, matchNotionPage, type NotionWorkerTask } from "./email-ai";
 import {
   GmailApiError, decryptToken, encryptToken, getMessage, parseGmailMessage, refreshGmailAccessToken, sendGmailReply, watchInbox,
 } from "./gmail";
 import { runWorkerOnce, type WorkerConnection, type WorkerDependencies, type WorkerTask } from "./gmail-worker";
-import { parseTaskPrompt, TaskParserError, type TaskAgentContext } from "./task-agent";
+import { parseTaskPrompt, taskTriggerFromResult, TaskParserError, type TaskAgentContext } from "./task-agent";
 import { VercelApiError, listFailedVercelDeployments, matchesVercelDeployment } from "./vercel";
-import { NotionApiError, getNotionPageContent, listNotionPages, refreshNotionToken } from "./notion";
+import { NotionApiError, getNotionPageContent, listNotionPages, matchesNotionPage, refreshNotionToken } from "./notion";
+import { evaluatePublicTrigger, publicSourceState, shouldFirePublicSignal } from "./public-sources";
+import { listUpcomingCalendarEvents, matchesIntegrationTrigger, refreshCalendarToken } from "./integrations";
 
 function googleConfig() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -69,7 +72,12 @@ async function recentMessages(connection: WorkerConnection, token: string, forma
     if (!pageToken) break;
   }
   if (pageToken) throw new Error("Gmail recovery exceeded the 500-message safety bound; manual resync is required");
-  return Promise.all([...new Set(ids)].map(async (id) => parseGmailMessage(await getMessage(token, id, format))));
+  const messages: import("./gmail").ParsedGmailMessage[] = [];
+  const uniqueIds = [...new Set(ids)];
+  for (let index = 0; index < uniqueIds.length; index += 10) {
+    messages.push(...await Promise.all(uniqueIds.slice(index, index + 10).map(async (id) => parseGmailMessage(await getMessage(token, id, format)))));
+  }
+  return messages;
 }
 
 function connectionShape(stored: NonNullable<Awaited<ReturnType<typeof getGmailConnectionById>>>): WorkerConnection {
@@ -98,6 +106,7 @@ const dependencies: WorkerDependencies = {
     await persistGmailMessage(connection, message);
   },
   loadRunDecision: ({ eventId, taskId, messageId }) => getTaskRunDecision({ taskId, notificationEventId: eventId, messageId }),
+  canDispatchCall: (task) => task.executionMode === "approval" ? Promise.resolve(true) : hasCalleCallCapacity(task.userId),
   matchTask: matchGmailMessage,
   claimRun: ({ eventId, taskId, messageId, decision, requiresApproval }) => claimTaskRun({ taskId, notificationEventId: eventId, messageId, decision, requiresApproval }),
   async dispatchCall({ runId, eventId: notificationEventId, task, message }) {
@@ -166,6 +175,7 @@ async function processApprovedTaskRun() {
   try {
     const trigger = run.trigger as import("./db").TaskTrigger;
     const action = run.action as import("./db").TaskAction;
+    if (!await hasCalleCallCapacity(run.userId)) throw new Error("Daily CALL-E call limit reached");
     if (trigger.type === "deployment.failed") {
       const event = run.eventHeaders as { deploymentId?: string; projectName?: string; target?: string | null; gitCommitMessage?: string | null } | null;
       if (!event?.deploymentId || !event.projectName) throw new Error("Approved Vercel run is missing deployment context");
@@ -192,6 +202,15 @@ async function processApprovedTaskRun() {
       await markTaskRunDispatched(run.id, call.id);
       return true;
     }
+    if (run.sourceKind === "public.signal" || run.sourceKind === "integration.event") {
+      if (!run.eventSnippet) throw new Error("Approved public-data run is missing signal context");
+      const briefing = `${action.task}\n\nSource event: ${run.eventSnippet}`;
+      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `${run.sourceKind === "public.signal" ? "public" : "integration"}:${run.id}` });
+      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, status: call.status, taskRunId: run.id });
+      await markTaskRunDispatched(run.id, call.id);
+      return true;
+    }
+    if (trigger.type !== "email.received") throw new Error(`Unsupported approved source: ${trigger.type}`);
     if (!run.gmailMessageId || !run.connectionId || !run.gmailAddress || !run.encryptedRefreshToken || !run.connectionStatus || !run.historyId) throw new Error("Approved Gmail run is missing connection context");
     const connection = connectionShape({ id: run.connectionId, userId: run.userId, gmailAddress: run.gmailAddress, encryptedRefreshToken: run.encryptedRefreshToken, grantedScopes: run.grantedScopes ?? [], labelMap: run.labelMap ?? {}, status: run.connectionStatus, historyId: run.historyId, watchExpiration: run.watchExpiration, lastSyncedAt: run.lastSyncedAt });
     const token = await getGmailAccessToken(connection);
@@ -211,16 +230,18 @@ async function processTaskCreation() {
   const job = await claimTaskCreation();
   if (!job) return false;
   try {
-    const stored = await getTaskContext(job.userId, { gmailConnectionId: job.gmailConnectionId, vercelConnectionId: job.vercelConnectionId, notionConnectionId: job.notionConnectionId });
+    const stored = await getTaskContext(job.userId, { gmailConnectionId: job.gmailConnectionId, vercelConnectionId: job.vercelConnectionId, notionConnectionId: job.notionConnectionId, integrationConnectionId: job.integrationConnectionId });
     if (!stored.profile) throw new Error("The task owner is unavailable");
     if (job.gmailConnectionId && stored.gmail?.status !== "connected") throw new Error("The selected Gmail connection is unavailable");
     if (job.vercelConnectionId && stored.vercel?.status !== "connected") throw new Error("The selected Vercel connection is unavailable");
     if (job.notionConnectionId && stored.notion?.status !== "connected") throw new Error("The selected Notion connection is unavailable");
+    if (job.integrationConnectionId && stored.integration?.status !== "connected") throw new Error("The selected integration connection is unavailable");
     const context: TaskAgentContext = {
       currentUser: { id: job.userId, email: stored.profile.email, name: stored.profile.name, defaultPhone: stored.profile.defaultPhone },
       gmail: { connected: stored.gmail?.status === "connected", email: stored.gmail?.gmailAddress ?? null, labels: Object.keys(stored.gmail?.labelMap ?? {}), labelIds: stored.gmail?.labelMap ?? {} },
       vercel: { connected: stored.vercel?.status === "connected", accountName: stored.vercel?.accountName ?? null, projects: stored.vercel?.projects ?? [] },
       notion: { connected: stored.notion?.status === "connected", workspaceName: stored.notion?.workspaceName ?? null, pages: stored.notion?.pages.map(({ id, title }) => ({ id, title })) ?? [] },
+      integration: { connected: stored.integration?.status === "connected", provider: stored.integration?.provider ?? null, label: stored.integration?.label ?? null },
       contacts: stored.contacts.map(({ id, name, email, phone }) => ({ id, name, email, phone })),
     };
     const parsed = await parseTaskPrompt(job.prompt, context);
@@ -235,23 +256,7 @@ async function processTaskCreation() {
       await completeTaskCreation({ id: job.id, question: "What E.164 phone number should Kordy call?", context, parserModel: parsed.model });
       return true;
     }
-    const trigger = parsed.result.trigger.source === "gmail" ? {
-      type: "email.received" as const, match: "and" as const,
-      senders: parsed.result.trigger.rules.senders.map((value) => value.toLowerCase()),
-      subjectKeywords: parsed.result.trigger.rules.subjectKeywords,
-      bodyKeywords: parsed.result.trigger.rules.bodyKeywords,
-      labels: parsed.result.trigger.rules.labels.map((name) => context.gmail.labelIds[name]!),
-    } : parsed.result.trigger.source === "vercel" ? {
-      type: "deployment.failed" as const,
-      projectIds: parsed.result.trigger.rules.projectIds,
-      projectNames: parsed.result.trigger.rules.projectNames,
-      environments: parsed.result.trigger.rules.environments,
-    } : {
-      type: "notion.page.updated" as const,
-      pageIds: parsed.result.trigger.rules.pageIds,
-      pageTitles: parsed.result.trigger.rules.pageTitles,
-      keywords: parsed.result.trigger.rules.keywords,
-    };
+    const trigger = taskTriggerFromResult(parsed.result, context);
     await completeTaskCreation({
       id: job.id,
       parserModel: parsed.model,
@@ -265,6 +270,91 @@ async function processTaskCreation() {
   return true;
 }
 
+async function processPublicSource() {
+  const task = await claimPublicTaskForPolling();
+  if (!task) return false;
+  let runId: string | null = null;
+  try {
+    const signal = await evaluatePublicTrigger(task.trigger);
+    const run = await recordPublicSignal(task, signal, publicSourceState(signal), shouldFirePublicSignal(task.publicSourceState, signal));
+    if (run && !run.awaitingApproval) {
+      runId = run.id;
+      const briefing = `${task.action.task}\n\nPublic signal: ${signal.summary}`;
+      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `public:${run.id}` });
+      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+      await markTaskRunDispatched(run.id, call.id);
+    }
+  } catch (error) {
+    if (runId) await markTaskRunFailed(runId, error instanceof Error ? error.message : String(error), null);
+    console.error(`Could not poll public source for task ${task.id}`, error);
+  }
+  return true;
+}
+
+function matchesIntegrationTask(task: Awaited<ReturnType<typeof listActiveIntegrationTasks>>[number], event: { provider: string; eventName: string; summary: string; occurredAt: string | null }) {
+  return matchesIntegrationTrigger(task.trigger, { provider: event.provider, name: event.eventName, summary: event.summary, occurredAt: event.occurredAt ?? new Date().toISOString() }, task.activationAt);
+}
+
+async function processIntegrationEvent() {
+  const event = await claimIntegrationSourceEvent();
+  if (!event) return false;
+  let failed = false;
+  for (const task of await listActiveIntegrationTasks(event.connectionId)) {
+    if (!matchesIntegrationTask(task, event)) continue;
+    const run = await claimIntegrationTaskRun({ taskId: task.id, eventId: event.id, requiresApproval: task.action.executionMode === "approval", evidence: [`Matched ${event.provider} event ${event.eventName}`, "source:integration"] });
+    if (!run || run.awaitingApproval) continue;
+    try {
+      const briefing = `${task.action.task}\n\nSource event: ${event.summary}`;
+      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `integration:${event.id}:task:${task.id}` });
+      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+      await markTaskRunDispatched(run.id, call.id);
+    } catch (error) {
+      failed = true;
+      await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null);
+    }
+  }
+  await advanceSourceEvent(event.id, failed ? "One or more integration calls failed" : undefined, null);
+  return true;
+}
+
+async function processGoogleCalendar() {
+  const connection = await claimCalendarConnectionForPolling();
+  if (!connection) return false;
+  try {
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+    if (!clientId || !clientSecret) throw new Error("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET");
+    const cachedToken = typeof connection.metadata.encryptedAccessToken === "string" ? connection.metadata.encryptedAccessToken : null;
+    const cachedExpiry = typeof connection.metadata.accessTokenExpiresAt === "number" ? connection.metadata.accessTokenExpiresAt : 0;
+    let accessToken: string;
+    if (cachedToken && cachedExpiry > Date.now() + 60_000) {
+      accessToken = decryptToken(cachedToken);
+    } else {
+      const token = await refreshCalendarToken(decryptToken(connection.encryptedCredential), clientId, clientSecret);
+      accessToken = token.access_token;
+      await updateIntegrationMetadata(connection.id, { encryptedAccessToken: encryptToken(accessToken), accessTokenExpiresAt: Date.now() + (token.expires_in ?? 3600) * 1000 });
+    }
+    const [events, tasks] = await Promise.all([listUpcomingCalendarEvents(accessToken), listActiveIntegrationTasks(connection.id)]);
+    const now = Date.now();
+    for (const task of tasks) {
+      for (const event of events) {
+        const startsInMinutes = (new Date(event.occurredAt).getTime() - now) / 60_000;
+        if (startsInMinutes < 0 || startsInMinutes > task.trigger.withinMinutes || !matchesIntegrationTask(task, { provider: "google_calendar", eventName: event.name, summary: event.summary, occurredAt: event.occurredAt })) continue;
+        const run = await recordCalendarTaskEvent(connection, task, event);
+        if (!run || run.awaitingApproval) continue;
+        const briefing = `${task.action.task}\n\nCalendar event: ${event.summary}\nStarts: ${event.occurredAt}`;
+        const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `calendar:${task.id}:${event.id}` });
+        await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+        await markTaskRunDispatched(run.id, call.id);
+      }
+    }
+  } catch (error) {
+    if (/Google (?:token refresh|Calendar request) failed \((?:400|401|403)\)/.test(error instanceof Error ? error.message : "")) await markIntegrationReconnect(connection.id);
+    else console.error(`Could not poll Google Calendar ${connection.label}`, error);
+  }
+  return true;
+}
+
 let vercelRetryAfter = 0;
 let notionRetryAfter = 0;
 
@@ -273,21 +363,30 @@ async function processNotionPages() {
   const connection = await claimNotionConnectionForPolling();
   if (!connection) return false;
   try {
-    const token = await refreshNotionToken({ refreshToken: decryptToken(connection.encryptedRefreshToken), ...notionConfig() });
-    const pages = await listNotionPages(token.access_token);
+    let accessToken = decryptToken(connection.encryptedAccessToken);
+    let refreshToken = decryptToken(connection.encryptedRefreshToken);
+    let pages: Awaited<ReturnType<typeof listNotionPages>>;
+    try {
+      pages = await listNotionPages(accessToken);
+    } catch (error) {
+      if (!(error instanceof NotionApiError) || error.status !== 401) throw error;
+      const token = await refreshNotionToken({ refreshToken, ...notionConfig() });
+      accessToken = token.access_token;
+      refreshToken = token.refresh_token ?? refreshToken;
+      pages = await listNotionPages(accessToken);
+    }
     const tasks = await listActiveNotionTasks(connection.id);
     const changed = pages.filter((page) => new Date(page.lastEditedTime).getTime() > new Date(connection.pollSince).getTime()).reverse();
     for (const summary of changed) {
-      const page = await getNotionPageContent(token.access_token, summary);
+      const matchingTasks = tasks.filter((task) => matchesNotionPage(summary, task.trigger));
+      if (!matchingTasks.length) continue;
+      const page = await getNotionPageContent(accessToken, summary);
       const eventId = await persistNotionPage({ connection, page });
       if (!eventId) continue;
       let failed = false;
-      for (const task of tasks) {
+      for (const task of matchingTasks) {
         if (task.activationAt && new Date(page.lastEditedTime).getTime() < new Date(task.activationAt).getTime()) continue;
-        const pageMatches = (!task.trigger.pageIds.length && !task.trigger.pageTitles.length)
-          || task.trigger.pageIds.includes(page.id)
-          || task.trigger.pageTitles.some((title) => title.toLowerCase() === page.title.toLowerCase());
-        if (!pageMatches) continue;
+        if (task.action.executionMode !== "approval" && !await hasCalleCallCapacity(task.userId)) continue;
         const workerTask: NotionWorkerTask = { originalPrompt: task.originalPrompt, instruction: task.action.task, pageIds: task.trigger.pageIds, pageTitles: task.trigger.pageTitles, keywords: task.trigger.keywords };
         try {
           const decision = await matchNotionPage(workerTask, page);
@@ -306,8 +405,8 @@ async function processNotionPages() {
       await advanceSourceEvent(eventId, failed ? "One or more Notion task evaluations failed" : undefined, null);
     }
     await completeNotionPoll(connection.id, connection.pollUntil, {
-      encryptedAccessToken: encryptToken(token.access_token),
-      encryptedRefreshToken: encryptToken(token.refresh_token ?? decryptToken(connection.encryptedRefreshToken)),
+      encryptedAccessToken: encryptToken(accessToken),
+      encryptedRefreshToken: encryptToken(refreshToken),
     }, pages.map(({ id, title, url }) => ({ id, title, url })));
   } catch (error) {
     if (error instanceof NotionApiError && (error.status === 401 || error.status === 403)) await markNotionReconnect(connection.id);
@@ -334,6 +433,7 @@ async function processVercelDeployments() {
       for (const task of tasks) {
         if (task.activationAt && deployment.created < new Date(task.activationAt).getTime()) continue;
         if (!matchesVercelDeployment(deployment, task.trigger)) continue;
+        if (task.action.executionMode !== "approval" && !await hasCalleCallCapacity(task.userId)) continue;
         const run = await claimVercelTaskRun({ taskId: task.id, eventId, requiresApproval: task.action.executionMode === "approval" });
         if (!run || run.awaitingApproval) continue;
         try {
@@ -367,14 +467,13 @@ async function processVercelDeployments() {
 
 export async function startWorker(signal?: AbortSignal) {
   await initializeDatabase();
-  googleConfig();
   if (!process.env.OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
   let nextRenewal = 0;
   while (!signal?.aborted) {
     if (Date.now() >= nextRenewal) {
       nextRenewal = Date.now() + (await renewWatches() ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000);
     }
-    if (await processTaskCreation() || await processConfirmedEmailReply() || await processApprovedTaskRun() || await processVercelDeployments() || await processNotionPages()) continue;
+    if (await processTaskCreation() || await processConfirmedEmailReply() || await processApprovedTaskRun() || await processIntegrationEvent() || await processGoogleCalendar() || await processPublicSource() || await processVercelDeployments() || await processNotionPages()) continue;
     if (!await runWorkerOnce(dependencies)) await Bun.sleep(1_000);
   }
 }

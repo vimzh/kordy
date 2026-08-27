@@ -76,6 +76,12 @@ export function refreshNotionToken(input: { refreshToken: string; clientId: stri
 
 export type NotionPage = { id: string; title: string; url: string; lastEditedTime: string };
 
+export function matchesNotionPage(page: Pick<NotionPage, "id" | "title">, rule: { pageIds: string[]; pageTitles: string[] }) {
+  return (!rule.pageIds.length && !rule.pageTitles.length)
+    || rule.pageIds.includes(page.id)
+    || rule.pageTitles.some((title) => title.toLowerCase() === page.title.toLowerCase());
+}
+
 function pageTitle(page: { properties?: Record<string, { type?: string; title?: Array<{ plain_text?: string }> }> }) {
   const property = Object.values(page.properties ?? {}).find((value) => value.type === "title");
   return property?.title?.map((part) => part.plain_text ?? "").join("").trim() || "Untitled";
@@ -112,10 +118,12 @@ function richText(block: { type?: string; [key: string]: unknown }) {
 export async function getNotionPageContent(accessToken: string, page: NotionPage) {
   const lines: string[] = [];
   const queue = [page.id];
+  let requests = 0;
   while (queue.length && lines.join("\n").length < 64_000) {
     const blockId = queue.shift()!;
     let cursor: string | undefined;
     do {
+      if (requests++ >= 100) throw new Error("Notion page traversal exceeded the 100-request safety bound");
       const result = await notionRequest<{
         results: Array<{ id: string; type?: string; has_children?: boolean; [key: string]: unknown }>;
         has_more: boolean;

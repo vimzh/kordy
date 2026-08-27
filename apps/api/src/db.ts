@@ -3,7 +3,9 @@ import { SQL } from "bun";
 import { and, desc, eq, ilike, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sql";
 import { alias } from "drizzle-orm/pg-core";
-import { callTasks, contacts, gmailConnections, notionConnections, sourceEvents, taskRuns, tasks, users, vercelConnections } from "./schema";
+import { callTasks, contacts, gmailConnections, integrationConnections, notionConnections, sourceEvents, taskRuns, tasks, users, vercelConnections } from "./schema";
+import type { PublicSignal, PublicSourceState } from "./public-sources";
+import type { IntegrationEvent, IntegrationProvider } from "./integrations";
 
 export type Contact = {
   id: string;
@@ -37,7 +39,68 @@ export type NotionTaskTrigger = {
   keywords: string[];
 };
 
-export type TaskTrigger = GmailTaskTrigger | VercelTaskTrigger | NotionTaskTrigger;
+export type IntegrationTaskTrigger = {
+  type: "integration.event";
+  provider: IntegrationProvider;
+  eventNames: string[];
+  keywords: string[];
+  withinMinutes: number;
+};
+
+export type PublicTaskTrigger = {
+  type: "weather.rain_forecast";
+  location: string;
+  latitude: number;
+  longitude: number;
+  minimumPrecipitationMm: number;
+  withinHours: number;
+  consecutiveHours: number;
+} | {
+  type: "sec.filing.published";
+  cik: string;
+  companyName: string;
+  forms: string[];
+} | {
+  type: "usgs.earthquake.detected";
+  location: string;
+  latitude: number;
+  longitude: number;
+  radiusKm: number;
+  minimumMagnitude: number;
+} | {
+  type: "nasa.event.opened";
+  categories: string[];
+  location: string;
+  bbox: [number, number, number, number] | [];
+} | {
+  type: "fx.rate.threshold";
+  base: string;
+  quote: string;
+  operator: "above" | "below";
+  threshold: number;
+} | {
+  type: "india.stock.price_threshold";
+  symbol: string;
+  companyName: string;
+  exchange: "NSE" | "BSE";
+  operator: "above" | "below";
+  price: number;
+} | {
+  type: "india.stock.daily_move";
+  symbol: string;
+  companyName: string;
+  exchange: "NSE" | "BSE";
+  direction: "gain" | "loss";
+  percent: number;
+} | {
+  type: "india.stock.volume_threshold";
+  symbol: string;
+  companyName: string;
+  exchange: "NSE" | "BSE";
+  minimumVolume: number;
+};
+
+export type TaskTrigger = GmailTaskTrigger | VercelTaskTrigger | NotionTaskTrigger | IntegrationTaskTrigger | PublicTaskTrigger;
 
 export type TaskAction = {
   type: "calle.call";
@@ -55,6 +118,7 @@ export type Task = {
   gmailConnectionId: string | null;
   vercelConnectionId: string | null;
   notionConnectionId: string | null;
+  integrationConnectionId: string | null;
   originalPrompt: string;
   status: "creating" | "parsing" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed";
   trigger: TaskTrigger | null;
@@ -63,8 +127,21 @@ export type Task = {
   clarificationContext: unknown;
   parserModel: string;
   executionMode: "automatic" | "approval";
+  publicSourceState: PublicSourceState | null;
+  lastPolledAt: string | null;
   createdAt: string;
   updatedAt: string;
+};
+
+export type IntegrationConnection = {
+  id: string;
+  userId: string;
+  provider: IntegrationProvider;
+  label: string;
+  encryptedCredential: string;
+  metadata: Record<string, unknown>;
+  status: "connected" | "needs_reconnect" | "disconnected";
+  lastPolledAt: string;
 };
 
 export type GmailConnection = {
@@ -206,6 +283,20 @@ export async function initializeDatabase() {
     );
     CREATE UNIQUE INDEX IF NOT EXISTS notion_connections_user_workspace_key ON notion_connections(user_id, workspace_id);
 
+    CREATE TABLE IF NOT EXISTS integration_connections (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      provider TEXT NOT NULL CHECK (provider IN ('github', 'stripe', 'google_calendar', 'n8n')),
+      label TEXT NOT NULL,
+      encrypted_credential TEXT NOT NULL,
+      metadata JSONB NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL CHECK (status IN ('connected', 'needs_reconnect', 'disconnected')),
+      last_polled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS integration_connections_user_provider_key ON integration_connections(user_id, provider);
+
     CREATE TABLE IF NOT EXISTS tasks (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -228,6 +319,9 @@ export async function initializeDatabase() {
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'automatic';
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS vercel_connection_id TEXT REFERENCES vercel_connections(id) ON DELETE SET NULL;
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS notion_connection_id TEXT REFERENCES notion_connections(id) ON DELETE SET NULL;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS integration_connection_id TEXT REFERENCES integration_connections(id) ON DELETE SET NULL;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS public_source_state JSONB;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
     ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
     ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('creating', 'parsing', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed'));
 
@@ -255,8 +349,9 @@ export async function initializeDatabase() {
     ALTER TABLE source_events ALTER COLUMN gmail_connection_id DROP NOT NULL;
     ALTER TABLE source_events ADD COLUMN IF NOT EXISTS vercel_connection_id TEXT REFERENCES vercel_connections(id) ON DELETE CASCADE;
     ALTER TABLE source_events ADD COLUMN IF NOT EXISTS notion_connection_id TEXT REFERENCES notion_connections(id) ON DELETE CASCADE;
+    ALTER TABLE source_events ADD COLUMN IF NOT EXISTS integration_connection_id TEXT REFERENCES integration_connections(id) ON DELETE CASCADE;
     ALTER TABLE source_events DROP CONSTRAINT IF EXISTS source_events_kind_check;
-    ALTER TABLE source_events ADD CONSTRAINT source_events_kind_check CHECK (kind IN ('gmail.notification', 'gmail.message', 'vercel.deployment.failed', 'notion.page.updated'));
+    ALTER TABLE source_events ADD CONSTRAINT source_events_kind_check CHECK (kind IN ('gmail.notification', 'gmail.message', 'vercel.deployment.failed', 'notion.page.updated', 'public.signal', 'integration.event'));
 
     DO $$
     DECLARE r RECORD;
@@ -320,6 +415,13 @@ export async function initializeDatabase() {
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reply_message_id TEXT;
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reply_error TEXT;
     CREATE UNIQUE INDEX IF NOT EXISTS call_tasks_run_key ON call_tasks(task_run_id) WHERE task_run_id IS NOT NULL;
+
+    CREATE TABLE IF NOT EXISTS call_dispatch_reservations (
+      event_key TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS call_dispatch_reservations_user_created_idx ON call_dispatch_reservations(user_id, created_at);
   `));
 }
 
@@ -375,15 +477,16 @@ export async function updateContactEmail(userId: string, id: string, email: stri
   return contact ? { ...contact, id: String(contact.id) } : null;
 }
 
-export async function getTaskContext(userId: string, input: { gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null }) {
-  const [profile, gmail, vercel, notion, contacts] = await Promise.all([
+export async function getTaskContext(userId: string, input: { gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null }) {
+  const [profile, gmail, vercel, notion, integration, contacts] = await Promise.all([
     getProfile(userId),
     input.gmailConnectionId ? getGmailConnection(userId, input.gmailConnectionId) : null,
     input.vercelConnectionId ? getVercelConnection(userId, input.vercelConnectionId) : null,
     input.notionConnectionId ? getNotionConnection(userId, input.notionConnectionId) : null,
+    input.integrationConnectionId ? getIntegrationConnection(userId, input.integrationConnectionId) : null,
     listContacts(userId),
   ]);
-  return { profile, gmail, vercel, notion, contacts };
+  return { profile, gmail, vercel, notion, integration, contacts };
 }
 
 export async function findTaskByRequest(userId: string, requestId: string) {
@@ -398,6 +501,16 @@ export async function getTask(userId: string, id: string) {
 
 export async function listTasks(userId: string) {
   return taskQuery(userId);
+}
+
+export async function taskCreationCapacity(userId: string) {
+  const rows = await db.execute<{ active: number; recent: number }>(sql`
+    SELECT
+      COUNT(*) FILTER (WHERE status NOT IN ('archived', 'parse_failed'))::int AS active,
+      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '1 hour')::int AS recent
+    FROM tasks WHERE user_id = ${userId}
+  `);
+  return rows[0] ?? { active: 0, recent: 0 };
 }
 
 export async function listActiveWorkerTasks(gmailConnectionId: string) {
@@ -428,6 +541,7 @@ const taskSelection = {
   gmailConnectionId: tasks.gmailConnectionId,
   vercelConnectionId: tasks.vercelConnectionId,
   notionConnectionId: tasks.notionConnectionId,
+  integrationConnectionId: tasks.integrationConnectionId,
   originalPrompt: tasks.originalPrompt,
   status: tasks.status,
   trigger: tasks.trigger,
@@ -436,6 +550,8 @@ const taskSelection = {
   clarificationContext: tasks.clarificationContext,
   parserModel: tasks.parserModel,
   executionMode: tasks.executionMode,
+  publicSourceState: tasks.publicSourceState,
+  lastPolledAt: tasks.lastPolledAt,
   createdAt: tasks.createdAt,
   updatedAt: tasks.updatedAt,
 };
@@ -450,7 +566,7 @@ async function taskQuery(userId: string, id?: string, requestId?: string): Promi
 
 export async function createTask(input: {
   id: string; userId: string; requestId: string; prompt: string; status: Task["status"];
-  gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; trigger?: TaskTrigger | null; action?: TaskAction | null; question?: string | null; context?: unknown; parserModel: string; executionMode?: "automatic" | "approval";
+  gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null; trigger?: TaskTrigger | null; action?: TaskAction | null; question?: string | null; context?: unknown; parserModel: string; executionMode?: "automatic" | "approval";
 }) {
   await db.insert(tasks).values({
     id: input.id,
@@ -461,6 +577,7 @@ export async function createTask(input: {
     gmailConnectionId: input.gmailConnectionId ?? null,
     vercelConnectionId: input.vercelConnectionId ?? null,
     notionConnectionId: input.notionConnectionId ?? null,
+    integrationConnectionId: input.integrationConnectionId ?? null,
     trigger: input.trigger ?? null,
     action: input.action ?? null,
     clarificationQuestion: input.question ?? null,
@@ -473,7 +590,7 @@ export async function createTask(input: {
 }
 
 export async function claimTaskCreation() {
-  const rows = await db.execute<{ id: string; userId: string; prompt: string; gmailConnectionId: string | null; vercelConnectionId: string | null; notionConnectionId: string | null; executionMode: "automatic" | "approval" }>(sql`
+  const rows = await db.execute<{ id: string; userId: string; prompt: string; gmailConnectionId: string | null; vercelConnectionId: string | null; notionConnectionId: string | null; integrationConnectionId: string | null; executionMode: "automatic" | "approval" }>(sql`
     WITH next AS (
       SELECT id FROM tasks
       WHERE status = 'creating' OR (status = 'parsing' AND updated_at < NOW() - INTERVAL '5 minutes')
@@ -482,7 +599,7 @@ export async function claimTaskCreation() {
     UPDATE tasks t SET status = 'parsing', updated_at = NOW()
     FROM next WHERE t.id = next.id
     RETURNING t.id, t.user_id AS "userId", t.original_prompt AS prompt,
-      t.gmail_connection_id AS "gmailConnectionId", t.vercel_connection_id AS "vercelConnectionId", t.notion_connection_id AS "notionConnectionId", t.execution_mode AS "executionMode"
+      t.gmail_connection_id AS "gmailConnectionId", t.vercel_connection_id AS "vercelConnectionId", t.notion_connection_id AS "notionConnectionId", t.integration_connection_id AS "integrationConnectionId", t.execution_mode AS "executionMode"
   `);
   return rows[0] ?? null;
 }
@@ -506,13 +623,14 @@ export async function failTaskCreation(id: string, parserModel: string, error: s
     .where(and(eq(tasks.id, id), eq(tasks.status, "parsing")));
 }
 
-export async function resolveTaskClarification(input: { id: string; userId: string; gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; prompt: string; trigger: TaskTrigger; action: TaskAction; parserModel: string }) {
+export async function resolveTaskClarification(input: { id: string; userId: string; gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null; prompt: string; trigger: TaskTrigger; action: TaskAction; parserModel: string }) {
   const [task] = await db.update(tasks).set({
     originalPrompt: input.prompt,
     status: "active",
     gmailConnectionId: input.gmailConnectionId ?? null,
     vercelConnectionId: input.vercelConnectionId ?? null,
     notionConnectionId: input.notionConnectionId ?? null,
+    integrationConnectionId: input.integrationConnectionId ?? null,
     trigger: input.trigger,
     action: input.action,
     clarificationQuestion: null,
@@ -535,6 +653,79 @@ export async function updateTaskStatus(userId: string, id: string, status: "acti
   const [task] = await db.update(tasks).set({ status, updatedAt: sql`now()` })
     .where(and(eq(tasks.id, id), eq(tasks.userId, userId), ne(tasks.status, "needs_clarification"))).returning(taskSelection);
   return task ? { ...task, trigger: task.trigger as TaskTrigger | null, action: task.action as TaskAction | null } : null;
+}
+
+export async function claimPublicTaskForPolling() {
+  const rows = await db.execute<{
+    id: string;
+    userId: string;
+    originalPrompt: string;
+    trigger: PublicTaskTrigger;
+    action: TaskAction;
+    publicSourceState: PublicSourceState | null;
+  }>(sql`
+    WITH next AS (
+      SELECT id FROM tasks
+      WHERE status = 'active'
+        AND trigger->>'type' IN ('weather.rain_forecast', 'sec.filing.published', 'usgs.earthquake.detected', 'nasa.event.opened', 'fx.rate.threshold', 'india.stock.price_threshold', 'india.stock.daily_move', 'india.stock.volume_threshold')
+        AND (
+          (
+            trigger->>'type' NOT LIKE 'india.stock.%'
+            AND (last_polled_at IS NULL OR last_polled_at <= NOW() - INTERVAL '15 minutes')
+          ) OR (
+            trigger->>'type' LIKE 'india.stock.%'
+            AND (
+              last_polled_at IS NULL OR (
+                (last_polled_at AT TIME ZONE 'Asia/Kolkata')::date < (NOW() AT TIME ZONE 'Asia/Kolkata')::date
+                AND (NOW() AT TIME ZONE 'Asia/Kolkata')::time >= TIME '15:45'
+                AND EXTRACT(ISODOW FROM NOW() AT TIME ZONE 'Asia/Kolkata') BETWEEN 1 AND 5
+              )
+            )
+          )
+        )
+      ORDER BY last_polled_at NULLS FIRST, created_at
+      FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE tasks t SET last_polled_at = NOW()
+    FROM next WHERE t.id = next.id
+    RETURNING t.id, t.user_id AS "userId", t.original_prompt AS "originalPrompt", t.trigger, t.action,
+      t.public_source_state AS "publicSourceState"
+  `);
+  return rows[0] ?? null;
+}
+
+export async function recordPublicSignal(task: {
+  id: string;
+  userId: string;
+  trigger: PublicTaskTrigger;
+  action: TaskAction;
+}, signal: PublicSignal, state: PublicSourceState, fire: boolean) {
+  let run: { id: string } | undefined;
+  if (fire) {
+    const [event] = await db.insert(sourceEvents).values({
+      id: randomId(),
+      userId: task.userId,
+      kind: "public.signal",
+      dedupKey: `public:${task.id}:${signal.fingerprint}`,
+      headers: { provider: task.trigger.type, signal: signal.summary },
+      snippet: signal.summary,
+      occurredAt: signal.occurredAt,
+      processingState: "completed",
+    }).onConflictDoUpdate({
+      target: sourceEvents.dedupKey,
+      set: { updatedAt: sql`now()` },
+    }).returning({ id: sourceEvents.id });
+    [run] = await db.insert(taskRuns).values({
+      id: randomId(),
+      taskId: task.id,
+      sourceEventId: event!.id,
+      status: "pending",
+      approvalStatus: task.action.executionMode === "approval" ? "pending" : "not_required",
+      matchingEvidence: [signal.summary, "source:public"],
+    }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
+  }
+  await db.update(tasks).set({ publicSourceState: state }).where(eq(tasks.id, task.id));
+  return run ? { ...run, awaitingApproval: task.action.executionMode === "approval" } : null;
 }
 
 export async function getGmailConnection(userId: string, id: string) {
@@ -676,10 +867,14 @@ export async function claimVercelConnectionForPolling() {
   const rows = await db.execute<VercelConnection & { pollSince: string; pollUntil: string }>(sql`
     WITH next AS (
       SELECT * FROM vercel_connections
-      WHERE status = 'connected' AND last_polled_at <= NOW() - INTERVAL '15 seconds'
+      WHERE status = 'connected' AND last_polled_at <= NOW() - INTERVAL '5 minutes'
+        AND EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.vercel_connection_id = vercel_connections.id AND tasks.status = 'active'
+        )
       ORDER BY last_polled_at FOR UPDATE SKIP LOCKED LIMIT 1
     )
-    UPDATE vercel_connections v SET updated_at = NOW()
+    UPDATE vercel_connections v SET last_polled_at = NOW(), updated_at = NOW()
     FROM next WHERE v.id = next.id
     RETURNING v.id, v.user_id AS "userId", v.account_id AS "accountId", v.account_name AS "accountName",
       v.account_slug AS "accountSlug", v.team_id AS "teamId", v.encrypted_access_token AS "encryptedAccessToken",
@@ -792,10 +987,14 @@ export async function claimNotionConnectionForPolling() {
   const rows = await db.execute<NotionConnection & { pollSince: string; pollUntil: string }>(sql`
     WITH next AS (
       SELECT * FROM notion_connections
-      WHERE status = 'connected' AND last_polled_at <= NOW() - INTERVAL '30 seconds'
+      WHERE status = 'connected' AND last_polled_at <= NOW() - INTERVAL '15 minutes'
+        AND EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.notion_connection_id = notion_connections.id AND tasks.status = 'active'
+        )
       ORDER BY last_polled_at FOR UPDATE SKIP LOCKED LIMIT 1
     )
-    UPDATE notion_connections n SET updated_at = NOW()
+    UPDATE notion_connections n SET last_polled_at = NOW(), updated_at = NOW()
     FROM next WHERE n.id = next.id
     RETURNING n.id, n.user_id AS "userId", n.workspace_id AS "workspaceId", n.workspace_name AS "workspaceName",
       n.workspace_icon AS "workspaceIcon", n.encrypted_access_token AS "encryptedAccessToken", n.encrypted_refresh_token AS "encryptedRefreshToken",
@@ -854,6 +1053,128 @@ export async function claimNotionTaskRun(input: { taskId: string; eventId: strin
     matchingEvidence: input.evidence,
   }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
   return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
+}
+
+const integrationConnectionSelection = {
+  id: integrationConnections.id,
+  userId: integrationConnections.userId,
+  provider: integrationConnections.provider,
+  label: integrationConnections.label,
+  encryptedCredential: integrationConnections.encryptedCredential,
+  metadata: integrationConnections.metadata,
+  status: integrationConnections.status,
+  lastPolledAt: integrationConnections.lastPolledAt,
+};
+
+export async function getIntegrationConnection(userId: string, id: string) {
+  const [connection] = await db.select(integrationConnectionSelection).from(integrationConnections)
+    .where(and(eq(integrationConnections.userId, userId), eq(integrationConnections.id, id))).limit(1);
+  return connection ?? null;
+}
+
+export async function getIntegrationConnectionById(id: string) {
+  const [connection] = await db.select(integrationConnectionSelection).from(integrationConnections)
+    .where(eq(integrationConnections.id, id)).limit(1);
+  return connection ?? null;
+}
+
+export async function listIntegrationConnections(userId: string) {
+  return db.select(integrationConnectionSelection).from(integrationConnections)
+    .where(eq(integrationConnections.userId, userId)).orderBy(desc(integrationConnections.createdAt));
+}
+
+export async function saveIntegrationConnection(input: Omit<IntegrationConnection, "lastPolledAt">) {
+  await db.insert(integrationConnections).values({ ...input, lastPolledAt: new Date().toISOString() }).onConflictDoUpdate({
+    target: [integrationConnections.userId, integrationConnections.provider],
+    set: { label: input.label, encryptedCredential: input.encryptedCredential, metadata: input.metadata, status: "connected", lastPolledAt: sql`now()`, updatedAt: sql`now()` },
+  });
+  const [saved] = await db.select(integrationConnectionSelection).from(integrationConnections)
+    .where(and(eq(integrationConnections.userId, input.userId), eq(integrationConnections.provider, input.provider))).limit(1);
+  return saved!;
+}
+
+export async function disconnectIntegration(connectionId: string) {
+  await db.update(integrationConnections).set({ status: "disconnected", encryptedCredential: "", updatedAt: sql`now()` })
+    .where(eq(integrationConnections.id, connectionId));
+}
+
+export async function markIntegrationReconnect(connectionId: string) {
+  await db.update(integrationConnections).set({ status: "needs_reconnect", updatedAt: sql`now()` })
+    .where(eq(integrationConnections.id, connectionId));
+}
+
+export async function updateIntegrationMetadata(connectionId: string, metadata: Record<string, unknown>) {
+  await db.update(integrationConnections).set({ metadata, updatedAt: sql`now()` }).where(eq(integrationConnections.id, connectionId));
+}
+
+export async function claimCalendarConnectionForPolling() {
+  const rows = await db.execute<IntegrationConnection>(sql`
+    WITH next AS (
+      SELECT id FROM integration_connections
+      WHERE provider = 'google_calendar' AND status = 'connected' AND last_polled_at <= NOW() - INTERVAL '5 minutes'
+        AND EXISTS (
+          SELECT 1 FROM tasks
+          WHERE tasks.integration_connection_id = integration_connections.id AND tasks.status = 'active'
+        )
+      ORDER BY last_polled_at FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE integration_connections i SET last_polled_at = NOW(), updated_at = NOW()
+    FROM next WHERE i.id = next.id
+    RETURNING i.id, i.user_id AS "userId", i.provider, i.label, i.encrypted_credential AS "encryptedCredential", i.metadata, i.status, i.last_polled_at AS "lastPolledAt"
+  `);
+  return rows[0] ?? null;
+}
+
+export async function persistIntegrationEvent(connection: IntegrationConnection, event: IntegrationEvent) {
+  const [stored] = await db.insert(sourceEvents).values({
+    id: randomId(), userId: connection.userId, integrationConnectionId: connection.id, kind: "integration.event",
+    dedupKey: `integration:${connection.id}:${event.id}`,
+    headers: { provider: connection.provider, eventName: event.name }, snippet: event.summary,
+    occurredAt: event.occurredAt, processingState: "pending",
+  }).onConflictDoNothing({ target: sourceEvents.dedupKey }).returning({ id: sourceEvents.id });
+  return stored?.id ?? null;
+}
+
+export async function claimIntegrationSourceEvent() {
+  const rows = await db.execute<{ id: string; connectionId: string; provider: IntegrationProvider; eventName: string; summary: string; occurredAt: string | null }>(sql`
+    WITH next AS (
+      SELECT id FROM source_events
+      WHERE kind = 'integration.event' AND processing_state = 'pending' AND available_at <= NOW()
+      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE source_events e SET processing_state = 'processing', attempts = attempts + 1, updated_at = NOW()
+    FROM next WHERE e.id = next.id
+    RETURNING e.id, e.integration_connection_id AS "connectionId", e.headers->>'provider' AS provider,
+      e.headers->>'eventName' AS "eventName", e.snippet AS summary, e.occurred_at AS "occurredAt"
+  `);
+  return rows[0] ?? null;
+}
+
+export async function listActiveIntegrationTasks(connectionId: string) {
+  const rows = await db.select({
+    id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt,
+    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt,
+  }).from(tasks).where(and(eq(tasks.integrationConnectionId, connectionId), eq(tasks.status, "active")));
+  return rows.map((row) => ({ ...row, trigger: row.trigger as IntegrationTaskTrigger, action: row.action as TaskAction }));
+}
+
+export async function claimIntegrationTaskRun(input: { taskId: string; eventId: string; requiresApproval: boolean; evidence: unknown }) {
+  const [run] = await db.insert(taskRuns).values({
+    id: randomId(), taskId: input.taskId, sourceEventId: input.eventId, status: "pending",
+    approvalStatus: input.requiresApproval ? "pending" : "not_required", matchingEvidence: input.evidence,
+  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
+  return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
+}
+
+export async function recordCalendarTaskEvent(connection: IntegrationConnection, task: { id: string; action: TaskAction }, event: IntegrationEvent) {
+  const [stored] = await db.insert(sourceEvents).values({
+    id: randomId(), userId: connection.userId, integrationConnectionId: connection.id, kind: "integration.event",
+    dedupKey: `calendar:${connection.id}:${task.id}:${event.id}`,
+    headers: { provider: "google_calendar", eventName: event.name }, snippet: event.summary,
+    occurredAt: event.occurredAt, processingState: "completed",
+  }).onConflictDoNothing({ target: sourceEvents.dedupKey }).returning({ id: sourceEvents.id });
+  if (!stored) return null;
+  return claimIntegrationTaskRun({ taskId: task.id, eventId: stored.id, requiresApproval: task.action.executionMode === "approval", evidence: [`Calendar event starts at ${event.occurredAt}`, "source:google_calendar"] });
 }
 
 export async function markGmailReconnect(connectionId: string) {
@@ -995,8 +1316,8 @@ export async function listTaskRuns(userId: string) {
     taskPrompt: tasks.originalPrompt,
     status: taskRuns.status,
     approvalStatus: taskRuns.approvalStatus,
-    sender: sql<string | null>`coalesce(${sourceEvents.headers}->>'from', case when ${sourceEvents.kind} = 'vercel.deployment.failed' then 'Vercel' when ${sourceEvents.kind} = 'notion.page.updated' then 'Notion' end)`,
-    subject: sql<string | null>`coalesce(${sourceEvents.headers}->>'subject', (${sourceEvents.headers}->>'projectName') || ' deployment failed', (${sourceEvents.headers}->>'pageTitle') || ' updated')`,
+    sender: sql<string | null>`coalesce(${sourceEvents.headers}->>'from', case when ${sourceEvents.kind} = 'vercel.deployment.failed' then 'Vercel' when ${sourceEvents.kind} = 'notion.page.updated' then 'Notion' when ${sourceEvents.kind} = 'public.signal' then 'Public data' end)`,
+    subject: sql<string | null>`coalesce(${sourceEvents.headers}->>'subject', (${sourceEvents.headers}->>'projectName') || ' deployment failed', (${sourceEvents.headers}->>'pageTitle') || ' updated', ${sourceEvents.headers}->>'signal')`,
     snippet: sql<string | null>`coalesce(${sourceEvents.snippet}, ${sourceEvents.headers}->>'gitCommitMessage')`,
     matchingEvidence: taskRuns.matchingEvidence,
     callId: taskRuns.callTaskId,
@@ -1019,9 +1340,18 @@ export async function decideTaskRunApproval(userId: string, runId: string, decis
 }
 
 export async function claimApprovedTaskRun() {
-  const [claimed] = await db.update(taskRuns).set({ status: "calling", updatedAt: sql`now()` })
-    .where(and(eq(taskRuns.status, "pending"), eq(taskRuns.approvalStatus, "approved")))
-    .returning({ id: taskRuns.id });
+  const rows = await db.execute<{ id: string }>(sql`
+    WITH next AS (
+      SELECT id FROM task_runs
+      WHERE approval_status = 'approved' AND (
+        status = 'pending' OR (status = 'calling' AND call_task_id IS NULL AND updated_at < NOW() - INTERVAL '10 minutes')
+      )
+      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE task_runs r SET status = 'calling', updated_at = NOW()
+    FROM next WHERE r.id = next.id RETURNING r.id
+  `);
+  const [claimed] = rows;
   if (!claimed) return null;
   const [run] = await db.select({
     id: taskRuns.id, taskId: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt, trigger: tasks.trigger, action: tasks.action,
@@ -1038,6 +1368,38 @@ export async function saveCallTask(call: { id: string; userId: string; task: str
   await db.insert(callTasks).values({ ...call, taskRunId: call.taskRunId ?? null }).onConflictDoNothing({ target: callTasks.id });
 }
 
+export async function reserveCallDispatch(userId: string, eventId: string, dailyLimit: number) {
+  const eventKey = `${userId}:${eventId}`;
+  const rows = await db.execute<{ eventKey: string }>(sql`
+    WITH locked AS MATERIALIZED (
+      SELECT pg_advisory_xact_lock(hashtextextended(${userId}, 0))
+    ), existing AS (
+      SELECT event_key FROM call_dispatch_reservations WHERE event_key = ${eventKey}
+    ), inserted AS (
+      INSERT INTO call_dispatch_reservations (event_key, user_id)
+      SELECT ${eventKey}, ${userId} FROM locked
+      WHERE NOT EXISTS (SELECT 1 FROM existing)
+        AND (SELECT COUNT(*) FROM call_dispatch_reservations WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours') < ${dailyLimit}
+      ON CONFLICT DO NOTHING
+      RETURNING event_key
+    )
+    SELECT event_key AS "eventKey" FROM existing
+    UNION ALL
+    SELECT event_key AS "eventKey" FROM inserted
+    LIMIT 1
+  `);
+  return rows.length > 0;
+}
+
+export async function hasCallDispatchCapacity(userId: string, dailyLimit: number) {
+  const rows = await db.execute<{ allowed: boolean }>(sql`
+    SELECT (COUNT(*) < ${dailyLimit}) AS allowed
+    FROM call_dispatch_reservations
+    WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours'
+  `);
+  return rows[0]?.allowed ?? false;
+}
+
 export async function updateCallTask(call: { id: string; status: string; summary?: string | null; result?: unknown }) {
   await db.update(callTasks).set({
     status: call.status, summary: call.summary ?? null, result: call.result ?? null, updatedAt: sql`now()`,
@@ -1047,6 +1409,11 @@ export async function updateCallTask(call: { id: string; status: string; summary
     result: call.result ?? null,
     updatedAt: sql`now()`,
   }).where(eq(taskRuns.callTaskId, call.id));
+}
+
+export async function getStoredCallTask(id: string) {
+  const [call] = await db.select({ id: callTasks.id, status: callTasks.status }).from(callTasks).where(eq(callTasks.id, id)).limit(1);
+  return call ?? null;
 }
 
 export async function queueConfirmedEmailReply(callId: string) {
@@ -1071,9 +1438,16 @@ export type PendingEmailReply = {
 };
 
 export async function claimPendingEmailReply(): Promise<PendingEmailReply | null> {
-  const [claimed] = await db.update(callTasks).set({ replyStatus: "sending", updatedAt: sql`now()` })
-    .where(and(eq(callTasks.replyStatus, "pending"), isNull(callTasks.replyMessageId)))
-    .returning({ id: callTasks.id });
+  const rows = await db.execute<{ id: string }>(sql`
+    WITH next AS (
+      SELECT id FROM call_tasks
+      WHERE reply_status = 'pending' AND reply_message_id IS NULL
+      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+    )
+    UPDATE call_tasks c SET reply_status = 'sending', updated_at = NOW()
+    FROM next WHERE c.id = next.id RETURNING c.id
+  `);
+  const [claimed] = rows;
   if (!claimed) return null;
 
   const [reply] = await db.select({

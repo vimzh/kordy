@@ -44,6 +44,19 @@ function sourceContext(task: Task) {
     const pages = task.trigger.pageTitles.length ? task.trigger.pageTitles.join(", ") : "all shared pages";
     return task.trigger.keywords.length ? `${pages} · ${task.trigger.keywords.join(", ")}` : `${pages} · any update`;
   }
+  if (task.trigger.type === "integration.event") {
+    const events = task.trigger.eventNames.length ? task.trigger.eventNames.join(", ") : "any event";
+    const keywords = task.trigger.keywords.length ? ` · ${task.trigger.keywords.join(", ")}` : "";
+    return task.trigger.provider === "google_calendar" ? `${events} · within ${task.trigger.withinMinutes} minutes${keywords}` : `${events}${keywords}`;
+  }
+  if (task.trigger.type === "weather.rain_forecast") return `${task.trigger.location} · at least ${task.trigger.minimumPrecipitationMm} mm within ${task.trigger.withinHours} hours`;
+  if (task.trigger.type === "sec.filing.published") return `${task.trigger.companyName} · ${task.trigger.forms.join(", ")}`;
+  if (task.trigger.type === "usgs.earthquake.detected") return `${task.trigger.location} · magnitude ${task.trigger.minimumMagnitude}+ within ${task.trigger.radiusKm} km`;
+  if (task.trigger.type === "nasa.event.opened") return `${task.trigger.location || "Global"} · ${task.trigger.categories.join(", ")}`;
+  if (task.trigger.type === "fx.rate.threshold") return `${task.trigger.base}/${task.trigger.quote} ${task.trigger.operator} ${task.trigger.threshold}`;
+  if (task.trigger.type === "india.stock.price_threshold") return `${task.trigger.symbol}:${task.trigger.exchange} closes ${task.trigger.operator} ₹${task.trigger.price}`;
+  if (task.trigger.type === "india.stock.daily_move") return `${task.trigger.symbol}:${task.trigger.exchange} · daily ${task.trigger.direction} of ${task.trigger.percent}%`;
+  if (task.trigger.type === "india.stock.volume_threshold") return `${task.trigger.symbol}:${task.trigger.exchange} · daily volume of ${task.trigger.minimumVolume.toLocaleString("en-IN")}+`;
   const values = [
     ...task.trigger.senders,
     ...task.trigger.subjectKeywords,
@@ -54,7 +67,22 @@ function sourceContext(task: Task) {
 }
 
 function sourceName(task: Task) {
-  return task.trigger?.type === "deployment.failed" ? "Vercel" : task.trigger?.type === "notion.page.updated" ? "Notion" : "Gmail";
+  if (task.trigger?.type === "integration.event") return { github: "GitHub", stripe: "Stripe", google_calendar: "Google Calendar", n8n: "n8n" }[task.trigger.provider];
+  const names: Record<NonNullable<Task["trigger"]>["type"], string> = {
+    "email.received": "Gmail",
+    "deployment.failed": "Vercel",
+    "notion.page.updated": "Notion",
+    "integration.event": "Integration",
+    "weather.rain_forecast": "MET Norway",
+    "sec.filing.published": "SEC EDGAR",
+    "usgs.earthquake.detected": "USGS",
+    "nasa.event.opened": "NASA EONET",
+    "fx.rate.threshold": "Frankfurter",
+    "india.stock.price_threshold": "Indian stocks (EOD)",
+    "india.stock.daily_move": "Indian stocks (EOD)",
+    "india.stock.volume_threshold": "Indian stocks (EOD)",
+  };
+  return task.trigger ? names[task.trigger.type] : "Not resolved";
 }
 
 function useTasks() {
@@ -209,7 +237,7 @@ export function TriggersOverview({ contacts }: { contacts: Contact[] }) {
       <header className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Triggers</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Voice-call workflows watching your connected sources.</p>
+          <p className="mt-1 text-sm text-muted-foreground">Voice-call workflows watching connected and public sources.</p>
         </div>
         <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
           <DialogTrigger asChild>
@@ -321,7 +349,7 @@ export function TriggerDetails({ taskId }: { taskId: string }) {
                 <dd className="mt-1 text-sm">{sourceName(task)}</dd>
               </div>
               <div className="sm:col-span-2">
-                <dt className="text-xs font-medium text-muted-foreground">Matching email context</dt>
+                <dt className="text-xs font-medium text-muted-foreground">Matching context</dt>
                 <dd className="mt-1 text-sm">{sourceContext(task)}</dd>
               </div>
               <div>
