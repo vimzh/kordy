@@ -9,6 +9,7 @@ import {
   type GmailWatch,
   type ParsedGmailMessage,
 } from "./gmail";
+import { calleProviderError, type CalleProviderError } from "./calle";
 
 export type SourceEvent = {
   id: string;
@@ -58,7 +59,7 @@ export interface WorkerDependencies {
   claimRun(input: { eventId: string; taskId: string; messageId: string; decision: WorkerMatchDecision; requiresApproval: boolean }): Promise<WorkerRun | null>;
   dispatchCall(input: { runId: string; eventId: string; task: WorkerTask; message: ParsedGmailMessage }): Promise<{ id: string }>;
   markRunComplete(runId: string, callId: string): Promise<void>;
-  markRunFailed(runId: string, error: string, retryAt: Date | null): Promise<void>;
+  markRunFailed(runId: string, error: string, retryAt: Date | null, providerError?: CalleProviderError | null): Promise<void>;
   advanceCursor(connectionId: string, historyId: string): Promise<void>;
   recoverMessages(connection: WorkerConnection, accessToken: string, format: "metadata" | "full"): Promise<ParsedGmailMessage[]>;
   resetWatch(connectionId: string, watch: GmailWatch): Promise<void>;
@@ -91,7 +92,9 @@ export function retryDelayMs(attempt: number, random = Math.random) {
 
 export function callRetryAt(error: unknown, previousAttempts: number, now = Date.now(), random = Math.random) {
   return retryDisposition(error) === "retry" && previousAttempts < 7
-    ? new Date(now + retryDelayMs(previousAttempts, random))
+    ? new Date(now + (typeof error === "object" && error !== null && "retryAfterMs" in error && typeof error.retryAfterMs === "number"
+      ? error.retryAfterMs
+      : retryDelayMs(previousAttempts, random)))
     : null;
 }
 
@@ -139,7 +142,7 @@ async function processMessage(
       await deps.markRunComplete(run.id, call.id);
     } catch (error) {
       const retryAt = callRetryAt(error, run.attempts);
-      await deps.markRunFailed(run.id, errorMessage(error), retryAt);
+      await deps.markRunFailed(run.id, errorMessage(error), retryAt, calleProviderError(error));
       if (retryAt) throw new WorkerRetryError(errorMessage(error), retryAt);
       terminalFailure = true;
     }

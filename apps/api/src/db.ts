@@ -6,6 +6,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { callTasks, contacts, gmailConnections, integrationConnections, notionConnections, sourceEvents, taskRuns, tasks, users, vercelConnections } from "./schema";
 import type { PublicSignal, PublicSourceState } from "./public-sources";
 import type { IntegrationEvent, IntegrationProvider } from "./integrations";
+import type { CalleAnsweredBy, CalleCallRecipient, CalleCompletionConfidence, CalleProviderError, CalleSource } from "./calle";
 
 export type Contact = {
   id: string;
@@ -110,6 +111,12 @@ export type TaskAction = {
   phone: string;
   task: string;
   executionMode?: "automatic" | "approval";
+};
+
+export type CallProfileUpdate = {
+  defaultPhone?: string | null;
+  callRegion?: string | null;
+  callLocale?: string | null;
 };
 
 export type Task = {
@@ -220,9 +227,13 @@ export async function initializeDatabase() {
       name TEXT,
       picture TEXT,
       default_phone VARCHAR(16),
+      call_region VARCHAR(2),
+      call_locale VARCHAR(35),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS call_region VARCHAR(2);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS call_locale VARCHAR(35);
 
     CREATE TABLE IF NOT EXISTS contacts (
       id BIGSERIAL PRIMARY KEY,
@@ -397,6 +408,7 @@ export async function initializeDatabase() {
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) NOT NULL DEFAULT 'not_required';
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_error JSONB;
     ALTER TABLE task_runs ALTER COLUMN available_at DROP NOT NULL;
 
     CREATE TABLE IF NOT EXISTS call_tasks (
@@ -414,6 +426,18 @@ export async function initializeDatabase() {
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reply_status VARCHAR(20) NOT NULL DEFAULT 'not_requested';
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reply_message_id TEXT;
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reply_error TEXT;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS source VARCHAR(30) NOT NULL DEFAULT 'generic';
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS region VARCHAR(2);
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS locale VARCHAR(35);
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS task_completed BOOLEAN;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS completion_confidence JSONB;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '[]';
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS recipients JSONB NOT NULL DEFAULT '[]';
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS answered_by VARCHAR(20);
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS failure_code TEXT;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS failure_message TEXT;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS provider_event_id TEXT;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
     CREATE UNIQUE INDEX IF NOT EXISTS call_tasks_run_key ON call_tasks(task_run_id) WHERE task_run_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS call_dispatch_reservations (
@@ -442,13 +466,20 @@ export async function upsertUser(user: { sub: string; email?: string; name?: str
 export async function getProfile(userId: string) {
   const [profile] = await db.select({
     email: users.email, name: users.name, picture: users.picture, defaultPhone: users.defaultPhone,
+    callRegion: users.callRegion, callLocale: users.callLocale,
   }).from(users).where(eq(users.id, userId)).limit(1);
   return profile ?? null;
 }
 
-export async function updateProfile(userId: string, defaultPhone: string | null) {
-  const [profile] = await db.update(users).set({ defaultPhone, updatedAt: sql`now()` }).where(eq(users.id, userId)).returning({
+export async function updateProfile(userId: string, update: CallProfileUpdate) {
+  const [profile] = await db.update(users).set({
+    ...(update.defaultPhone !== undefined ? { defaultPhone: update.defaultPhone } : {}),
+    ...(update.callRegion !== undefined ? { callRegion: update.callRegion } : {}),
+    ...(update.callLocale !== undefined ? { callLocale: update.callLocale } : {}),
+    updatedAt: sql`now()`,
+  }).where(eq(users.id, userId)).returning({
     email: users.email, name: users.name, picture: users.picture, defaultPhone: users.defaultPhone,
+    callRegion: users.callRegion, callLocale: users.callLocale,
   });
   return profile ?? null;
 }
@@ -1280,18 +1311,33 @@ export async function claimTaskRun(input: {
     status: "pending",
     approvalStatus: input.requiresApproval ? "pending" : "not_required",
     matchingEvidence,
-  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id, attempts: taskRuns.attempts });
-  return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
+  }).onConflictDoUpdate({
+    target: [taskRuns.taskId, taskRuns.sourceEventId],
+    set: {
+      status: "pending",
+      attempts: sql`${taskRuns.attempts} + 1`,
+      availableAt: sql`now()`,
+      error: null,
+      providerError: null,
+      updatedAt: sql`now()`,
+    },
+    setWhere: and(
+      eq(taskRuns.status, "failed"),
+      eq(taskRuns.approvalStatus, "not_required"),
+      lte(taskRuns.availableAt, sql`now()`),
+    ),
+  }).returning({ id: taskRuns.id, attempts: taskRuns.attempts, approvalStatus: taskRuns.approvalStatus });
+  return run ? { id: run.id, attempts: run.attempts, awaitingApproval: run.approvalStatus === "pending" } : null;
 }
 
 export async function markTaskRunDispatched(runId: string, callId: string) {
-  await db.update(taskRuns).set({ status: "calling", callTaskId: callId, error: null, updatedAt: sql`now()` })
+  await db.update(taskRuns).set({ status: "calling", callTaskId: callId, error: null, providerError: null, updatedAt: sql`now()` })
     .where(eq(taskRuns.id, runId));
 }
 
-export async function markTaskRunFailed(runId: string, error: string, retryAt: Date | null) {
+export async function markTaskRunFailed(runId: string, error: string, retryAt: Date | null, providerError?: CalleProviderError | null) {
   await db.update(taskRuns).set({
-    status: "failed", error, availableAt: retryAt?.toISOString() ?? null, updatedAt: sql`now()`,
+    status: "failed", error, providerError: providerError ?? null, availableAt: retryAt?.toISOString() ?? null, updatedAt: sql`now()`,
   }).where(eq(taskRuns.id, runId));
 }
 
@@ -1323,11 +1369,22 @@ export async function listTaskRuns(userId: string) {
     callId: taskRuns.callTaskId,
     result: taskRuns.result,
     error: taskRuns.error,
+    providerError: taskRuns.providerError,
+    callSource: callTasks.source,
+    callSummary: callTasks.summary,
+    taskCompleted: callTasks.taskCompleted,
+    completionConfidence: callTasks.completionConfidence,
+    callEvidence: callTasks.evidence,
+    recipients: callTasks.recipients,
+    answeredBy: callTasks.answeredBy,
+    failureCode: callTasks.failureCode,
+    failureMessage: callTasks.failureMessage,
     createdAt: taskRuns.createdAt,
     updatedAt: taskRuns.updatedAt,
   }).from(taskRuns)
     .innerJoin(tasks, eq(tasks.id, taskRuns.taskId))
     .innerJoin(sourceEvents, eq(sourceEvents.id, taskRuns.sourceEventId))
+    .leftJoin(callTasks, eq(callTasks.id, taskRuns.callTaskId))
     .where(eq(tasks.userId, userId)).orderBy(desc(taskRuns.createdAt)).limit(100);
 }
 
@@ -1364,7 +1421,7 @@ export async function claimApprovedTaskRun() {
   return run ?? null;
 }
 
-export async function saveCallTask(call: { id: string; userId: string; task: string; phone: string; status: string; taskRunId?: string }) {
+export async function saveCallTask(call: { id: string; userId: string; task: string; phone: string; source: CalleSource; status: string; taskRunId?: string }) {
   await db.insert(callTasks).values({ ...call, taskRunId: call.taskRunId ?? null }).onConflictDoNothing({ target: callTasks.id });
 }
 
@@ -1400,15 +1457,67 @@ export async function hasCallDispatchCapacity(userId: string, dailyLimit: number
   return rows[0]?.allowed ?? false;
 }
 
-export async function updateCallTask(call: { id: string; status: string; summary?: string | null; result?: unknown }) {
-  await db.update(callTasks).set({
-    status: call.status, summary: call.summary ?? null, result: call.result ?? null, updatedAt: sql`now()`,
-  }).where(eq(callTasks.id, call.id));
-  await db.update(taskRuns).set({
-    status: call.status === "completed" ? "completed" : call.status === "failed" ? "failed" : "calling",
-    result: call.result ?? null,
-    updatedAt: sql`now()`,
-  }).where(eq(taskRuns.callTaskId, call.id));
+export async function updateCallTask(call: {
+  id: string;
+  status: string;
+  summary?: string | null;
+  result?: unknown;
+  taskCompleted?: boolean | null;
+  completionConfidence?: CalleCompletionConfidence | null;
+  evidence?: string[];
+  recipients?: CalleCallRecipient[];
+  answeredBy?: CalleAnsweredBy | null;
+  failureCode?: string | null;
+  failureMessage?: string | null;
+  providerEventId?: string | null;
+  completedAt?: string | null;
+  queueEmailReply?: boolean;
+}) {
+  const recipient = call.recipients?.[0];
+  const terminalFailure = call.status === "failed" || call.status === "canceled";
+  await db.transaction(async (tx) => {
+    await tx.update(callTasks).set({
+      status: call.status,
+      summary: call.summary ?? null,
+      result: call.result ?? null,
+      taskCompleted: call.taskCompleted ?? null,
+      completionConfidence: call.completionConfidence ?? null,
+      evidence: call.evidence ?? [],
+      recipients: call.recipients ?? [],
+      answeredBy: call.answeredBy ?? null,
+      region: recipient?.region ?? null,
+      locale: recipient?.locale ?? null,
+      failureCode: call.failureCode ?? null,
+      failureMessage: call.failureMessage ?? null,
+      providerEventId: call.providerEventId ?? null,
+      completedAt: call.completedAt ?? null,
+      updatedAt: sql`now()`,
+    }).where(eq(callTasks.id, call.id));
+    await tx.update(taskRuns).set({
+      status: call.status === "completed" ? "completed" : terminalFailure ? "failed" : "calling",
+      result: call.result ?? null,
+      error: terminalFailure ? call.failureMessage ?? call.failureCode ?? "CALL-E call failed" : null,
+      providerError: terminalFailure ? {
+        status: null,
+        code: call.failureCode ?? "call_failed",
+        message: call.failureMessage ?? "CALL-E call failed",
+        details: {},
+        retryAfterSeconds: null,
+      } : null,
+      updatedAt: sql`now()`,
+    }).where(eq(taskRuns.callTaskId, call.id));
+    if (call.queueEmailReply) {
+      await tx.update(callTasks).set({ replyStatus: "pending", replyError: null, updatedAt: sql`now()` })
+        .where(and(
+          eq(callTasks.id, call.id),
+          eq(callTasks.replyStatus, "not_requested"),
+          sql`exists (
+            select 1 from task_runs tr join tasks t on t.id = tr.task_id
+            where tr.id = ${callTasks.taskRunId} and t.trigger->>'type' = 'email.received'
+          )`,
+        ));
+    }
+  });
 }
 
 export async function getStoredCallTask(id: string) {
@@ -1416,21 +1525,12 @@ export async function getStoredCallTask(id: string) {
   return call ?? null;
 }
 
-export async function queueConfirmedEmailReply(callId: string) {
-  await db.update(callTasks).set({ replyStatus: "pending", replyError: null, updatedAt: sql`now()` })
-    .where(and(
-      eq(callTasks.id, callId),
-      eq(callTasks.replyStatus, "not_requested"),
-      sql`exists (
-        select 1 from task_runs tr join tasks t on t.id = tr.task_id
-        where tr.id = ${callTasks.taskRunId} and t.trigger->>'type' = 'email.received'
-      )`,
-    ));
-}
-
 export type PendingEmailReply = {
   callId: string;
   result: unknown;
+  completionConfidence: CalleCompletionConfidence | null;
+  answeredBy: CalleAnsweredBy | null;
+  taskCompleted: boolean | null;
   instruction: string;
   originalPrompt: string;
   gmailConnection: GmailConnection;
@@ -1453,6 +1553,9 @@ export async function claimPendingEmailReply(): Promise<PendingEmailReply | null
   const [reply] = await db.select({
     callId: callTasks.id,
     result: callTasks.result,
+    completionConfidence: callTasks.completionConfidence,
+    answeredBy: callTasks.answeredBy,
+    taskCompleted: callTasks.taskCompleted,
     instruction: tasks.action,
     originalPrompt: tasks.originalPrompt,
     gmailMessageId: sourceEvents.gmailMessageId,
@@ -1477,6 +1580,9 @@ export async function claimPendingEmailReply(): Promise<PendingEmailReply | null
   return {
     callId: reply.callId,
     result: reply.result,
+    completionConfidence: reply.completionConfidence,
+    answeredBy: reply.answeredBy as CalleAnsweredBy | null,
+    taskCompleted: reply.taskCompleted,
     instruction: action.task,
     originalPrompt: reply.originalPrompt,
     gmailMessageId: reply.gmailMessageId,
@@ -1510,9 +1616,21 @@ export async function listCallTasks(userId: string) {
     id: callTasks.id,
     task: callTasks.task,
     phone: callTasks.phone,
+    source: callTasks.source,
+    region: callTasks.region,
+    locale: callTasks.locale,
     status: callTasks.status,
     summary: callTasks.summary,
     result: callTasks.result,
+    taskCompleted: callTasks.taskCompleted,
+    completionConfidence: callTasks.completionConfidence,
+    evidence: callTasks.evidence,
+    recipients: callTasks.recipients,
+    answeredBy: callTasks.answeredBy,
+    failureCode: callTasks.failureCode,
+    failureMessage: callTasks.failureMessage,
+    providerEventId: callTasks.providerEventId,
+    completedAt: callTasks.completedAt,
     createdAt: callTasks.createdAt,
     updatedAt: callTasks.updatedAt,
   }).from(callTasks).where(eq(callTasks.userId, userId)).orderBy(desc(callTasks.createdAt));

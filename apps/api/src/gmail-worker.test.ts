@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { GmailApiError } from "./gmail";
+import { CalleApiError } from "./calle";
 import {
   callRetryAt,
   passesGmailRuleFilter,
@@ -67,6 +68,11 @@ test("retries transient calls through attempt seven and stops after attempt eigh
   const error = new TypeError("network error");
   expect(callRetryAt(error, 6, 0, () => 0)).toEqual(new Date(60_000));
   expect(callRetryAt(error, 7, 0, () => 0)).toBeNull();
+});
+
+test("honors CALL-E Retry-After without changing the idempotent operation", () => {
+  const error = new CalleApiError({ status: 429, code: "rate_limit_exceeded", message: "Try later.", details: {}, retryAfterSeconds: 12 });
+  expect(callRetryAt(error, 0, 1_000, () => 0)).toEqual(new Date(13_000));
 });
 
 test("uses capped exponential backoff with bounded jitter", () => {

@@ -1,6 +1,6 @@
 // Enforces the per-user call budget before creating a billable CALL-E call.
 import { createCalleCall } from "./calle";
-import { hasCallDispatchCapacity, reserveCallDispatch } from "./db";
+import { getProfile, hasCallDispatchCapacity, reserveCallDispatch } from "./db";
 
 function dailyCallLimit() {
   const value = Number(process.env.CALLE_DAILY_CALL_LIMIT ?? "20");
@@ -16,5 +16,11 @@ export function hasCalleCallCapacity(userId: string) {
 
 export async function dispatchCalleCall(input: Parameters<typeof createCalleCall>[0]) {
   if (!await reserveCallDispatch(input.userId, input.eventId, dailyCallLimit())) throw new CallBudgetExceededError("Daily CALL-E call limit reached");
-  return createCalleCall(input);
+  const profile = await getProfile(input.userId);
+  const isDefaultNumber = profile?.defaultPhone === input.phone;
+  return createCalleCall({
+    ...input,
+    region: input.region ?? (isDefaultNumber ? profile.callRegion : null),
+    locale: input.locale ?? (isDefaultNumber ? profile.callLocale : null),
+  });
 }

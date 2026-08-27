@@ -3,11 +3,14 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { clearSession, cookieValue, currentSession, finishGoogleAuth, sessionCookie, startGoogleAuth, type Session } from "./auth";
-import { confirmedReplyInstruction, getCalleCall, normalizePhone } from "./calle";
+import {
+  answeredBy, CalleApiError, calleSources, confirmedReplyInstruction, getCalleCall,
+  normalizeCallLocale, normalizeCallRegion, normalizePhone, type CalleSource,
+} from "./calle";
 import { CallBudgetExceededError, dispatchCalleCall as createCalleCall } from "./call-dispatch";
 import {
   createContact, createTask, decideTaskRunApproval, disconnectGmail, disconnectIntegration, disconnectNotion, disconnectVercel, enqueueGmailNotification, findTaskByRequest, getGmailConnection, getIntegrationConnectionById,
-  getGmailConnectionByAddress, getProfile, getStoredCallTask, getTask, getTaskContext, initializeDatabase, listCallTasks, listContacts, queueConfirmedEmailReply,
+  getGmailConnectionByAddress, getProfile, getStoredCallTask, getTask, getTaskContext, initializeDatabase, listCallTasks, listContacts,
   listGmailConnections, listIntegrationConnections, listNotionConnections, listTaskRuns, listTasks, listVercelConnections, persistIntegrationEvent, resolveTaskClarification, saveCallTask, saveGmailConnection, saveIntegrationConnection, saveNotionConnection, saveVercelConnection, updateCallTask,
   taskCreationCapacity, updateContactEmail, updateProfile, updateTaskClarification, updateTaskStatus, upsertUser, type TaskAction,
 } from "./db";
@@ -157,9 +160,24 @@ app.patch("/profile", async (c) => {
   const session = await user(c);
   if (!session) return c.json({ error: "Unauthorized" }, 401);
   const body = await c.req.json().catch(() => null);
-  const phone = body?.defaultPhone === null ? null : typeof body?.defaultPhone === "string" ? normalizePhone(body.defaultPhone) : null;
-  if (body?.defaultPhone !== null && !phone) return c.json({ error: "defaultPhone must be a valid E.164 number" }, 400);
-  return c.json({ profile: await updateProfile(session.sub, phone) });
+  const update: { defaultPhone?: string | null; callRegion?: string | null; callLocale?: string | null } = {};
+  if ("defaultPhone" in (body ?? {})) {
+    const phone = body.defaultPhone === null ? null : typeof body.defaultPhone === "string" ? normalizePhone(body.defaultPhone) : null;
+    if (body.defaultPhone !== null && !phone) return c.json({ error: "defaultPhone must be a valid E.164 number" }, 400);
+    update.defaultPhone = phone;
+  }
+  if ("callRegion" in (body ?? {})) {
+    const region = body.callRegion === null ? null : typeof body.callRegion === "string" ? normalizeCallRegion(body.callRegion) : null;
+    if (body.callRegion !== null && !region) return c.json({ error: "callRegion must be a supported CALL-E country code" }, 400);
+    update.callRegion = region;
+  }
+  if ("callLocale" in (body ?? {})) {
+    const locale = body.callLocale === null ? null : typeof body.callLocale === "string" ? normalizeCallLocale(body.callLocale) : null;
+    if (body.callLocale !== null && !locale) return c.json({ error: "callLocale must be a valid BCP 47 locale" }, 400);
+    update.callLocale = locale;
+  }
+  if (!Object.keys(update).length) return c.json({ error: "At least one profile setting is required" }, 400);
+  return c.json({ profile: await updateProfile(session.sub, update) });
 });
 
 app.get("/contacts", async (c) => {
@@ -264,7 +282,7 @@ app.post("/tasks/:id/clarify", async (c) => {
   const phone = normalizePhone(answer);
   const question = task.clarificationQuestion ?? "";
   const mention = task.originalPrompt.match(/@([^,]+?)(?:\s+when|\s+if|$)/i)?.[1]?.trim().toLowerCase();
-  if (phone && /phone|number/i.test(question) && !mention) await updateProfile(session.sub, phone);
+  if (phone && /phone|number/i.test(question) && !mention) await updateProfile(session.sub, { defaultPhone: phone });
   if (/email/i.test(question) && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(answer) && mention) {
     const contacts = await listContacts(session.sub);
     const matches = contacts.filter((contact) => contact.name.toLowerCase() === mention || contact.name.toLowerCase().includes(mention));
@@ -606,13 +624,29 @@ app.post("/calls", async (c) => {
   const task = typeof body?.task === "string" ? body.task.trim() : "";
   const phone = typeof body?.phone === "string" ? normalizePhone(body.phone) : null;
   const eventId = typeof body?.eventId === "string" ? body.eventId.trim() : "";
+  const source = typeof body?.source === "string" && calleSources.includes(body.source as CalleSource) ? body.source as CalleSource : "generic";
+  const region = body?.region === undefined || body.region === null ? null : typeof body.region === "string" ? normalizeCallRegion(body.region) : null;
+  const locale = body?.locale === undefined || body.locale === null ? null : typeof body.locale === "string" ? normalizeCallLocale(body.locale) : null;
   if (!task || !phone || !eventId) return c.json({ error: "Task, E.164 phone number, and eventId are required" }, 400);
+  if (body?.source !== undefined && source === "generic" && body.source !== "generic") return c.json({ error: "source is not supported" }, 400);
+  if (body?.region !== undefined && body.region !== null && !region) return c.json({ error: "region is not supported" }, 400);
+  if (body?.locale !== undefined && body.locale !== null && !locale) return c.json({ error: "locale must be a valid BCP 47 locale" }, 400);
   try {
-    const call = await createCalleCall({ task, phone, userId: session.sub, eventId });
-    await saveCallTask({ id: call.id, userId: session.sub, task, phone, status: call.status });
+    const call = await createCalleCall({ task, phone, userId: session.sub, eventId, source, region, locale });
+    await saveCallTask({ id: call.id, userId: session.sub, task, phone, source, status: call.status });
     return c.json({ call }, 201);
   } catch (error) {
     if (error instanceof CallBudgetExceededError) return c.json({ error: error.message }, 429);
+    if (error instanceof CalleApiError) {
+      const provider = error.providerError;
+      if (provider.retryAfterSeconds !== null) c.header("Retry-After", String(provider.retryAfterSeconds));
+      const status = provider.code === "rate_limit_exceeded" ? 429
+        : provider.code === "idempotency_conflict" ? 409
+          : provider.code === "insufficient_balance" || provider.code === "provider_unavailable" ? 503
+            : provider.status >= 400 && provider.status < 500 && provider.status !== 401 && provider.status !== 403 ? 422
+              : 502;
+      return c.json({ error: provider.message, code: provider.code, retryAfterSeconds: provider.retryAfterSeconds }, status as 422);
+    }
     console.error(error);
     return c.json({ error: "Could not create the CALL-E call" }, 502);
   }
@@ -626,11 +660,29 @@ app.post("/webhooks/calle", async (c) => {
   try {
     const stored = await getStoredCallTask(callId);
     if (!stored) return c.json({ error: "Unknown CALL-E call" }, 404);
-    if (stored.status === "completed" || stored.status === "failed") return c.json({ ok: true });
+    if (stored.status === "completed" || stored.status === "failed" || stored.status === "canceled") return c.json({ ok: true });
     const call = await getCalleCall(callId);
     if (call.id !== callId) return c.json({ error: "CALL-E call mismatch" }, 400);
-    await updateCallTask({ id: call.id, status: call.status, summary: call.summary, result: call.structured_result });
-    if (call.status === "completed" && confirmedReplyInstruction(call.structured_result)) await queueConfirmedEmailReply(call.id);
+    const recipientType = answeredBy(call);
+    const replyInstruction = call.status === "completed"
+      ? confirmedReplyInstruction(call.structured_result, call.completion_confidence, recipientType, call.task_completed)
+      : null;
+    await updateCallTask({
+      id: call.id,
+      status: call.status,
+      summary: call.summary,
+      result: call.structured_result,
+      taskCompleted: call.task_completed,
+      completionConfidence: call.completion_confidence,
+      evidence: call.evidence,
+      recipients: call.recipients,
+      answeredBy: recipientType,
+      failureCode: call.failure_code,
+      failureMessage: call.failure_message,
+      providerEventId: eventId,
+      completedAt: call.completed_at,
+      queueEmailReply: Boolean(replyInstruction),
+    });
     return c.json({ ok: true });
   } catch (error) {
     console.error(error);

@@ -44,6 +44,7 @@ import { matchesNotionPage } from "./notion";
 import { evaluatePublicTrigger, publicSourceState, shouldFirePublicSignal } from "./public-sources";
 import { users } from "./schema";
 import { matchesVercelDeployment, type VercelDeployment } from "./vercel";
+import type { CalleSource } from "./calle";
 
 const userId = `dry-run-${crypto.randomUUID()}`;
 const budgetUserId = `${userId}-budget`;
@@ -110,6 +111,19 @@ function connectionId(trigger: TaskTrigger) {
   if (trigger.type === "notion.page.updated") return { notionConnectionId };
   if (trigger.type === "integration.event") return { integrationConnectionId: integrationIds[trigger.provider] };
   return {};
+}
+
+function calleSource(trigger: TaskTrigger): CalleSource {
+  if (trigger.type === "email.received") return "gmail";
+  if (trigger.type === "deployment.failed") return "vercel";
+  if (trigger.type === "notion.page.updated") return "notion";
+  if (trigger.type === "integration.event") return trigger.provider;
+  if (trigger.type === "weather.rain_forecast") return "weather";
+  if (trigger.type === "sec.filing.published") return "sec";
+  if (trigger.type === "usgs.earthquake.detected") return "usgs";
+  if (trigger.type === "nasa.event.opened") return "nasa";
+  if (trigger.type === "fx.rate.threshold") return "fx";
+  return "india";
 }
 
 async function createRun(index: number, scenario: Scenario, action: TaskAction) {
@@ -256,8 +270,9 @@ test("64 call-me scenarios reach the CALL-E request boundary without making a ph
       const run = await createRun(index, scenario, action);
       expect(run).not.toBeNull();
       expect(run?.awaitingApproval).toBeFalsy();
-      const call = await dispatchCalleCall({ task: `${action.task}\n\nDry-run source matched.`, phone, userId, eventId: `dry-run:${index}` });
-      await saveCallTask({ id: call.id, userId, task: action.task, phone, status: call.status, taskRunId: run!.id });
+      const source = calleSource(scenario.trigger);
+      const call = await dispatchCalleCall({ task: `${action.task}\n\nDry-run source matched.`, phone, userId, eventId: `dry-run:${index}`, source });
+      await saveCallTask({ id: call.id, userId, task: action.task, phone, source, status: call.status, taskRunId: run!.id });
       await markTaskRunDispatched(run!.id, call.id);
     }
 
@@ -277,8 +292,8 @@ test("64 call-me scenarios reach the CALL-E request boundary without making a ph
 
     await upsertUser({ sub: budgetUserId, email: `${budgetUserId}@example.com` });
     process.env.CALLE_DAILY_CALL_LIMIT = "1";
-    await dispatchCalleCall({ task: "First budgeted dry run", phone, userId: budgetUserId, eventId: "first" });
-    await expect(dispatchCalleCall({ task: "Blocked budget dry run", phone, userId: budgetUserId, eventId: "second" })).rejects.toThrow("Daily CALL-E call limit reached");
+    await dispatchCalleCall({ task: "First budgeted dry run", phone, userId: budgetUserId, eventId: "first", source: "generic" });
+    await expect(dispatchCalleCall({ task: "Blocked budget dry run", phone, userId: budgetUserId, eventId: "second", source: "generic" })).rejects.toThrow("Daily CALL-E call limit reached");
     expect(requests).toHaveLength(65);
   } finally {
     globalThis.fetch = originalFetch;

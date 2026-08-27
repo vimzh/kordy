@@ -21,6 +21,19 @@ export type TaskRun = {
   callId?: string;
   result?: unknown;
   error?: string;
+  callSource?: string | null;
+  callSummary?: string | null;
+  taskCompleted?: boolean | null;
+  completionConfidence?: { score: number; label: string } | null;
+  callEvidence?: string[];
+  answeredBy?: string | null;
+  failureCode?: string | null;
+  failureMessage?: string | null;
+  recipients?: Array<{
+    attempts?: Array<{
+      transcript_turns?: Array<{ offset_seconds: number | null; speaker: "bot" | "user" | "unknown"; text: string }>;
+    }>;
+  }>;
   createdAt: string;
   updatedAt: string;
 };
@@ -29,12 +42,17 @@ const dateFormatter = new Intl.DateTimeFormat("en-IN", { dateStyle: "medium", ti
 
 function conclusion(run: TaskRun) {
   if (run.error) return run.error;
+  if (run.callSummary) return run.callSummary;
   if (typeof run.result === "string") return run.result;
   if (run.result && typeof run.result === "object") return JSON.stringify(run.result);
   if (run.status === "not_matched") return run.matchingEvidence?.[0] ?? "The email did not match this trigger.";
   if (run.status === "calling") return "The call is in progress.";
   if (run.status === "pending") return "Waiting to start the call.";
   return "No call result was recorded.";
+}
+
+function transcript(run: TaskRun) {
+  return run.recipients?.flatMap((recipient) => recipient.attempts ?? []).flatMap((attempt) => attempt.transcript_turns ?? []) ?? [];
 }
 
 export function LogsTable({ runs, tasks }: { runs: TaskRun[]; tasks: Task[] }) {
@@ -73,9 +91,26 @@ export function LogsTable({ runs, tasks }: { runs: TaskRun[]; tasks: Task[] }) {
               <TableCell className="max-w-72 whitespace-normal text-muted-foreground">
                 {[run.sender, run.subject, run.snippet].filter(Boolean).join(" · ") || "Gmail event received"}
               </TableCell>
-              <TableCell className="max-w-64 whitespace-normal">{conclusion(run)}</TableCell>
+              <TableCell className="max-w-72 whitespace-normal">
+                <p>{conclusion(run)}</p>
+                {run.answeredBy || run.completionConfidence ? (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {[run.answeredBy ? `Answered by ${run.answeredBy}` : null, run.completionConfidence ? `${run.completionConfidence.label} confidence` : null].filter(Boolean).join(" · ")}
+                  </p>
+                ) : null}
+                {transcript(run).length ? (
+                  <details className="mt-2 text-xs">
+                    <summary className="cursor-pointer font-medium text-foreground">View transcript</summary>
+                    <ol className="mt-2 space-y-1.5 border-l pl-3 text-muted-foreground">
+                      {transcript(run).map((turn, index) => (
+                        <li key={`${turn.offset_seconds ?? "unknown"}-${index}`}><span className="font-medium text-foreground">{turn.speaker === "bot" ? "Kordy" : turn.speaker === "user" ? "Recipient" : "Unknown"}:</span> {turn.text}</li>
+                      ))}
+                    </ol>
+                  </details>
+                ) : null}
+              </TableCell>
               <TableCell>
-                <span className="rounded-md bg-muted px-2 py-1 text-xs">Gmail</span>
+                <span className="rounded-md bg-muted px-2 py-1 text-xs">{run.callSource?.replaceAll("_", " ") ?? "Pending"}</span>
               </TableCell>
               <TableCell>
                 <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium">

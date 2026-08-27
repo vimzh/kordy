@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigserial,
+  boolean,
   check,
   index,
   integer,
@@ -23,6 +24,8 @@ export const users = pgTable("users", {
   name: text("name"),
   picture: text("picture"),
   defaultPhone: varchar("default_phone", { length: 16 }),
+  callRegion: varchar("call_region", { length: 2 }),
+  callLocale: varchar("call_locale", { length: 35 }),
   ...timestamps,
 });
 
@@ -182,6 +185,13 @@ export const taskRuns = pgTable("task_runs", {
   callTaskId: text("call_task_id"),
   result: jsonb("result"),
   error: text("error"),
+  providerError: jsonb("provider_error").$type<{
+    status: number | null;
+    code: string;
+    message: string;
+    details: Record<string, unknown>;
+    retryAfterSeconds: number | null;
+  }>(),
   approvalStatus: varchar("approval_status", { length: 20 }).default("not_required").notNull(),
   attempts: integer("attempts").default(0).notNull(),
   availableAt: timestamp("available_at", { withTimezone: true, mode: "string" }).defaultNow(),
@@ -196,9 +206,21 @@ export const callTasks = pgTable("call_tasks", {
   userId: text("user_id").notNull(),
   task: text("task").notNull(),
   phone: varchar("phone", { length: 16 }).notNull(),
+  source: varchar("source", { length: 30 }).default("generic").notNull(),
+  region: varchar("region", { length: 2 }),
+  locale: varchar("locale", { length: 35 }),
   status: varchar("status", { length: 40 }).notNull(),
   summary: text("summary"),
   result: jsonb("result"),
+  taskCompleted: boolean("task_completed"),
+  completionConfidence: jsonb("completion_confidence").$type<{ score: number; label: string }>(),
+  evidence: jsonb("evidence").$type<string[]>().default([]).notNull(),
+  recipients: jsonb("recipients").$type<unknown[]>().default([]).notNull(),
+  answeredBy: varchar("answered_by", { length: 20 }),
+  failureCode: text("failure_code"),
+  failureMessage: text("failure_message"),
+  providerEventId: text("provider_event_id"),
+  completedAt: timestamp("completed_at", { withTimezone: true, mode: "string" }),
   taskRunId: text("task_run_id").references(() => taskRuns.id, { onDelete: "set null" }),
   replyStatus: varchar("reply_status", { length: 20 }).default("not_requested").notNull(),
   replyMessageId: text("reply_message_id"),

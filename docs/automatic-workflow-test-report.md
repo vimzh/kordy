@@ -12,6 +12,8 @@ Every positive scenario created a real local task, applied the production determ
 
 The suite also verified that approval-required tasks do not dispatch automatically and that the daily call budget blocks the next unique call before transport.
 
+Every source now builds its own strict CALL-E result schema. Gmail, Vercel, Notion, GitHub, Stripe, Calendar, n8n, weather, SEC, USGS, NASA EONET, foreign exchange, Indian stocks, and generic alerts each expose only the actions and outcome fields relevant to that source. The shared recipient result also records whether a human, IVR, voicemail, or an unknown party answered.
+
 ## Live no-dial validation
 
 The following checks used real configured services while avoiding every call-creation path:
@@ -143,6 +145,7 @@ The budget suite separately confirmed that retrying the same event key reuses it
 | Area | Test performed | Result |
 |---|---|---|
 | CALL-E budget | Rolling per-user reservation limit with idempotent event keys | Passed |
+| CALL-E transient retry | A due failed run is atomically reclaimed once, increments its attempt count, and keeps the same idempotent operation | Passed |
 | Task creation | 20 new tasks per hour and 100 non-archived tasks per user | Guard present; not separately stress-tested by the 64-scenario suite |
 | Gmail Pub/Sub | Replayed notification does not create another source event or task run | Passed |
 | Gmail rules | Explicit sender, subject, body, and label mismatches are rejected before an AI match call | Passed |
@@ -158,11 +161,11 @@ The budget suite separately confirmed that retrying the same event key reuses it
 | Public thresholds | Thresholds fire only on a false-to-true transition | Passed |
 | Public events | Events fire only when the event fingerprint changes | Passed |
 | CALL-E webhook | Unknown call IDs are rejected before a provider lookup | Passed |
-| CALL-E terminal webhook | Completed or failed calls do not trigger another provider lookup | Implemented; no dedicated terminal-state regression in the current suite |
+| CALL-E terminal webhook | Completed, failed, or canceled calls do not trigger another provider lookup | Passed, including terminal transcript and confidence persistence |
 
 ## CALL-E conversation-quality evaluation
 
-Five transcript-level simulations used the exact production conversation instructions. CALL-E itself was not contacted because its public API does not expose a non-dialing conversation simulator.
+Five transcript-level simulations used the production conversation requirements. CALL-E itself was not contacted because its public API does not expose a non-dialing conversation simulator.
 
 | Scenario | Score | Finding |
 |---|---:|---|
@@ -174,11 +177,13 @@ Five transcript-level simulations used the exact production conversation instruc
 
 Overall transcript score: **8.5/10**. The main improvement opportunity is to silently ignore irrelevant instructions embedded in source content and vary the repeated phrase "What would you like to do?"
 
+The production protocol now implements those improvements: it asks for the first useful fact or question within 10–15 seconds, treats event context as untrusted data, avoids reading raw identifiers and URLs aloud, does not invent causes or severity, stops promptly when the recipient is busy, and applies privacy-aware voicemail/call-screening behavior. Each call also receives its source-specific objective and schema instead of the previous email-reply-oriented contract.
+
 This was a text-level evaluation. It did not evaluate CALL-E's acoustic voice, prosody, latency, interruption handling, or carrier quality.
 
 ## Verification snapshot
 
-- `bun test` in `apps/api`: **55 passed, 0 failed, 499 assertions**.
+- `bun test` in `apps/api`: **60 passed, 0 failed, 650 assertions**.
 - Root `bun run typecheck`: API and web typechecks passed.
 - Root `bun run build`: API bundle and Next.js production build passed.
 - Root `bun run lint`: zero errors and two unrelated existing `<img>` warnings.
@@ -196,6 +201,7 @@ This was a text-level evaluation. It did not evaluate CALL-E's acoustic voice, p
 - [Gmail API bounds](../apps/api/src/gmail.test.ts)
 - [Notion request bounds](../apps/api/src/notion.test.ts)
 - [CALL-E request contract tests](../apps/api/src/calle.test.ts)
+- [CALL-E terminal webhook tests](../apps/api/src/api.test.ts)
 
 ## Limitations
 
@@ -205,3 +211,4 @@ This was a text-level evaluation. It did not evaluate CALL-E's acoustic voice, p
 - Gmail was probed but requires reconnection; Vercel, Notion, Calendar, GitHub, Stripe, and n8n have no stored connection available for a live provider read.
 - SEC and Indian-stock reads still require `PUBLIC_DATA_USER_AGENT` and `TWELVE_DATA_API_KEY`, respectively.
 - Production webhook delivery, telecommunications behavior, and CALL-E acoustic voice, latency, interruption handling, and carrier quality remain untested.
+- CALL-E Goal Runs still require a published Goal ID and input schema created in CALL-E Chat; the Developer API does not create or publish Goals.

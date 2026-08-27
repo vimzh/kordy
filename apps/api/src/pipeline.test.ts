@@ -2,9 +2,9 @@ import { afterAll, expect, test } from "bun:test";
 import { count, eq } from "drizzle-orm";
 import {
   claimTaskCreation, claimTaskRun, completeTaskCreation, createTask, db, enqueueGmailNotification, getTask, getTaskRunDecision, initializeDatabase, listActiveWorkerTasks, listGmailConnections, markTaskRunDispatched, markTaskRunFailed,
-  persistGmailMessage, saveGmailConnection, upsertUser,
+  persistGmailMessage, saveCallTask, saveGmailConnection, updateCallTask, upsertUser,
 } from "./db";
-import { taskRuns, users } from "./schema";
+import { callTasks, taskRuns, users } from "./schema";
 
 const userId = "pipeline-test-user";
 const connectionId = "pipeline-connection";
@@ -49,10 +49,29 @@ test("a Gmail message can create only one task run even when its notification is
   await persistGmailMessage(connection, { id: "message-1", sender: "alice@example.com", subject: "Invoice", snippet: "Invoice attached" });
   const run = await claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-1", decision: matched });
   expect(run).not.toBeNull();
+  await saveCallTask({ id: "call-1", userId, task: "Explain the invoice email", phone: "+12025550123", source: "gmail", status: "queued", taskRunId: run!.id });
   await markTaskRunDispatched(run!.id, "call-1");
   expect(await claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-1", decision: matched })).toBeNull();
+  await updateCallTask({
+    id: "call-1",
+    status: "completed",
+    result: { requested_action: "send_reply", send_confirmed: "yes", reply_instruction: "Thanks.", evidence: "The recipient said yes." },
+    queueEmailReply: true,
+  });
+  expect((await db.select({ status: taskRuns.status }).from(taskRuns).where(eq(taskRuns.id, run!.id)))[0]?.status).toBe("completed");
+  expect((await db.select({ replyStatus: callTasks.replyStatus }).from(callTasks).where(eq(callTasks.id, "call-1")))[0]?.replyStatus).toBe("pending");
   const [{ value }] = await db.select({ value: count() }).from(taskRuns).where(eq(taskRuns.taskId, "pipeline-task"));
   expect(value).toBe(1);
+
+  await persistGmailMessage(connection, { id: "message-retry", sender: "alice@example.com", subject: "Invoice" });
+  const retryRun = await claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-retry", decision: matched });
+  await markTaskRunFailed(retryRun!.id, "CALL-E rate limited the request", new Date(Date.now() - 1_000));
+  const retriedClaims = await Promise.all([
+    claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-retry", decision: matched }),
+    claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-retry", decision: matched }),
+  ]);
+  expect(retriedClaims.filter(Boolean)).toHaveLength(1);
+  expect(retriedClaims.find(Boolean)).toMatchObject({ id: retryRun!.id, attempts: 1 });
 
   await persistGmailMessage(connection, { id: "message-terminal", sender: "alice@example.com", subject: "Invoice" });
   const terminalRun = await claimTaskRun({ taskId: "pipeline-task", notificationEventId: "notification-1", messageId: "message-terminal", decision: matched });

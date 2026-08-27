@@ -1,11 +1,11 @@
 // Separate durable worker that turns queued Gmail notifications into idempotent CALL-E calls.
-import { confirmedReplyInstruction, normalizePhone } from "./calle";
+import { calleProviderError, confirmedReplyInstruction, normalizePhone, type CalleSource } from "./calle";
 import { dispatchCalleCall as createCalleCall, hasCalleCallCapacity } from "./call-dispatch";
 import {
   advanceSourceEvent, claimCalendarConnectionForPolling, claimIntegrationSourceEvent, claimIntegrationTaskRun, claimNotionConnectionForPolling, claimNotionTaskRun, claimPublicTaskForPolling, claimSourceEvent, claimTaskCreation, claimTaskRun, claimVercelConnectionForPolling, claimVercelTaskRun, completeNotionPoll, completeTaskCreation, completeVercelPoll, failTaskCreation, getGmailConnectionById, getTaskContext, getTaskRunDecision, initializeDatabase,
   claimApprovedTaskRun, claimPendingEmailReply, listActiveWorkerTasks, listGmailConnectionsNeedingWatchRenewal, markEmailReplyFailed, markEmailReplySent, markGmailReconnect,
   listActiveIntegrationTasks, listActiveNotionTasks, listActiveVercelTasks, markIntegrationReconnect, markNotionReconnect, markTaskRunDispatched, markTaskRunFailed, markVercelReconnect, persistGmailMessage, persistNotionPage, persistVercelDeployment, recordCalendarTaskEvent, recordPublicSignal, saveCallTask, saveGmailConnection,
-  updateGmailCursor, updateGmailWatchExpiration, updateIntegrationMetadata,
+  updateGmailCursor, updateGmailWatchExpiration, updateIntegrationMetadata, type TaskTrigger,
 } from "./db";
 import { generateConfirmedEmailReply, generateNotionTaskContext, generateTaskContext, generateVercelTaskContext, matchGmailMessage, matchNotionPage, type NotionWorkerTask } from "./email-ai";
 import {
@@ -17,6 +17,23 @@ import { VercelApiError, listFailedVercelDeployments, matchesVercelDeployment } 
 import { NotionApiError, getNotionPageContent, listNotionPages, matchesNotionPage, refreshNotionToken } from "./notion";
 import { evaluatePublicTrigger, publicSourceState, shouldFirePublicSignal } from "./public-sources";
 import { listUpcomingCalendarEvents, matchesIntegrationTrigger, refreshCalendarToken } from "./integrations";
+
+function calleSourceForTrigger(trigger: TaskTrigger): CalleSource {
+  switch (trigger.type) {
+    case "email.received": return "gmail";
+    case "deployment.failed": return "vercel";
+    case "notion.page.updated": return "notion";
+    case "integration.event": return trigger.provider;
+    case "weather.rain_forecast": return "weather";
+    case "sec.filing.published": return "sec";
+    case "usgs.earthquake.detected": return "usgs";
+    case "nasa.event.opened": return "nasa";
+    case "fx.rate.threshold": return "fx";
+    case "india.stock.price_threshold":
+    case "india.stock.daily_move":
+    case "india.stock.volume_threshold": return "india";
+  }
+}
 
 function googleConfig() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -114,8 +131,8 @@ const dependencies: WorkerDependencies = {
     const decision = await getTaskRunDecision({ taskId: task.id, notificationEventId, messageId: message.id });
     if (!decision?.matches) throw new Error("Matched task run disappeared before CALL-E dispatch");
     const callTask = await generateTaskContext(task, message, decision);
-    const call = await createCalleCall({ task: callTask, phone: task.phone, userId: task.userId, eventId: callEventId });
-    await saveCallTask({ id: call.id, userId: task.userId, task: callTask, phone: task.phone, status: call.status, taskRunId: runId });
+    const call = await createCalleCall({ task: callTask, phone: task.phone, userId: task.userId, eventId: callEventId, source: "gmail" });
+    await saveCallTask({ id: call.id, userId: task.userId, task: callTask, phone: task.phone, source: "gmail", status: call.status, taskRunId: runId });
     return call;
   },
   markRunComplete: markTaskRunDispatched,
@@ -145,7 +162,7 @@ async function renewWatches() {
 async function processConfirmedEmailReply() {
   const reply = await claimPendingEmailReply();
   if (!reply) return false;
-  const replyInstruction = confirmedReplyInstruction(reply.result);
+  const replyInstruction = confirmedReplyInstruction(reply.result, reply.completionConfidence, reply.answeredBy, reply.taskCompleted);
   if (!replyInstruction) {
     await markEmailReplyFailed(reply.callId, "CALL-E result did not contain an explicit send confirmation");
     return true;
@@ -186,8 +203,8 @@ async function processApprovedTaskRun() {
         environment: event.target ?? null,
         commitMessage: event.gitCommitMessage ?? null,
       });
-      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `vercel:${event.deploymentId}:task:${run.taskId}` });
-      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, status: call.status, taskRunId: run.id });
+      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `vercel:${event.deploymentId}:task:${run.taskId}`, source: "vercel" });
+      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, source: "vercel", status: call.status, taskRunId: run.id });
       await markTaskRunDispatched(run.id, call.id);
       return true;
     }
@@ -197,16 +214,17 @@ async function processApprovedTaskRun() {
       const task: NotionWorkerTask = { originalPrompt: run.originalPrompt, instruction: action.task, pageIds: trigger.pageIds, pageTitles: trigger.pageTitles, keywords: trigger.keywords };
       const page = { id: event.pageId, title: event.pageTitle, url: event.pageUrl ?? "", lastEditedTime: "", content: run.eventSnippet ?? "" };
       const briefing = await generateNotionTaskContext(task, page, { matches: true, confidence: "high", reason: "Approved by the user." });
-      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `notion:${page.id}:task:${run.taskId}:approved` });
-      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, status: call.status, taskRunId: run.id });
+      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `notion:${page.id}:task:${run.taskId}:approved`, source: "notion" });
+      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, source: "notion", status: call.status, taskRunId: run.id });
       await markTaskRunDispatched(run.id, call.id);
       return true;
     }
     if (run.sourceKind === "public.signal" || run.sourceKind === "integration.event") {
       if (!run.eventSnippet) throw new Error("Approved public-data run is missing signal context");
       const briefing = `${action.task}\n\nSource event: ${run.eventSnippet}`;
-      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `${run.sourceKind === "public.signal" ? "public" : "integration"}:${run.id}` });
-      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, status: call.status, taskRunId: run.id });
+      const source = calleSourceForTrigger(trigger);
+      const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `${run.sourceKind === "public.signal" ? "public" : "integration"}:${run.id}`, source });
+      await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, source, status: call.status, taskRunId: run.id });
       await markTaskRunDispatched(run.id, call.id);
       return true;
     }
@@ -217,11 +235,11 @@ async function processApprovedTaskRun() {
     const message = parseGmailMessage(await getMessage(token, run.gmailMessageId, "full"));
     const task: WorkerTask = { id: run.taskId, userId: run.userId, originalPrompt: run.originalPrompt, instruction: action.task, phone: action.phone, senders: trigger.senders, subjectKeywords: trigger.subjectKeywords, bodyKeywords: trigger.bodyKeywords, labels: trigger.labels };
     const briefing = await generateTaskContext(task, message, { matches: true, confidence: "high", reason: "Approved by the user." });
-    const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `gmail:${message.id}:task:${run.taskId}` });
-    await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, status: call.status, taskRunId: run.id });
+    const call = await createCalleCall({ task: briefing, phone: action.phone, userId: run.userId, eventId: `gmail:${message.id}:task:${run.taskId}`, source: "gmail" });
+    await saveCallTask({ id: call.id, userId: run.userId, task: briefing, phone: action.phone, source: "gmail", status: call.status, taskRunId: run.id });
     await markTaskRunDispatched(run.id, call.id);
   } catch (error) {
-    await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null);
+    await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
   }
   return true;
 }
@@ -280,12 +298,13 @@ async function processPublicSource() {
     if (run && !run.awaitingApproval) {
       runId = run.id;
       const briefing = `${task.action.task}\n\nPublic signal: ${signal.summary}`;
-      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `public:${run.id}` });
-      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+      const source = calleSourceForTrigger(task.trigger);
+      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `public:${run.id}`, source });
+      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, source, status: call.status, taskRunId: run.id });
       await markTaskRunDispatched(run.id, call.id);
     }
   } catch (error) {
-    if (runId) await markTaskRunFailed(runId, error instanceof Error ? error.message : String(error), null);
+    if (runId) await markTaskRunFailed(runId, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
     console.error(`Could not poll public source for task ${task.id}`, error);
   }
   return true;
@@ -305,12 +324,13 @@ async function processIntegrationEvent() {
     if (!run || run.awaitingApproval) continue;
     try {
       const briefing = `${task.action.task}\n\nSource event: ${event.summary}`;
-      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `integration:${event.id}:task:${task.id}` });
-      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+      const source = task.trigger.provider;
+      const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `integration:${event.id}:task:${task.id}`, source });
+      await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, source, status: call.status, taskRunId: run.id });
       await markTaskRunDispatched(run.id, call.id);
     } catch (error) {
       failed = true;
-      await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null);
+      await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
     }
   }
   await advanceSourceEvent(event.id, failed ? "One or more integration calls failed" : undefined, null);
@@ -343,9 +363,13 @@ async function processGoogleCalendar() {
         const run = await recordCalendarTaskEvent(connection, task, event);
         if (!run || run.awaitingApproval) continue;
         const briefing = `${task.action.task}\n\nCalendar event: ${event.summary}\nStarts: ${event.occurredAt}`;
-        const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `calendar:${task.id}:${event.id}` });
-        await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
-        await markTaskRunDispatched(run.id, call.id);
+        try {
+          const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `calendar:${task.id}:${event.id}`, source: "google_calendar" });
+          await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, source: "google_calendar", status: call.status, taskRunId: run.id });
+          await markTaskRunDispatched(run.id, call.id);
+        } catch (error) {
+          await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
+        }
       }
     }
   } catch (error) {
@@ -388,17 +412,20 @@ async function processNotionPages() {
         if (task.activationAt && new Date(page.lastEditedTime).getTime() < new Date(task.activationAt).getTime()) continue;
         if (task.action.executionMode !== "approval" && !await hasCalleCallCapacity(task.userId)) continue;
         const workerTask: NotionWorkerTask = { originalPrompt: task.originalPrompt, instruction: task.action.task, pageIds: task.trigger.pageIds, pageTitles: task.trigger.pageTitles, keywords: task.trigger.keywords };
+        let runId: string | null = null;
         try {
           const decision = await matchNotionPage(workerTask, page);
           if (!decision.matches) continue;
           const run = await claimNotionTaskRun({ taskId: task.id, eventId, requiresApproval: task.action.executionMode === "approval", evidence: [decision.reason, `confidence:${decision.confidence}`, "source:notion"] });
           if (!run || run.awaitingApproval) continue;
+          runId = run.id;
           const briefing = await generateNotionTaskContext(workerTask, page, decision);
-          const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `notion:${page.id}:${page.lastEditedTime}:task:${task.id}` });
-          await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+          const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `notion:${page.id}:${page.lastEditedTime}:task:${task.id}`, source: "notion" });
+          await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, source: "notion", status: call.status, taskRunId: run.id });
           await markTaskRunDispatched(run.id, call.id);
         } catch (error) {
           failed = true;
+          if (runId) await markTaskRunFailed(runId, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
           console.error(`Could not process Notion task ${task.id}`, error);
         }
       }
@@ -444,12 +471,12 @@ async function processVercelDeployments() {
             environment: deployment.target,
             commitMessage: deployment.meta?.githubCommitMessage ?? deployment.meta?.gitlabCommitMessage ?? deployment.meta?.bitbucketCommitMessage ?? null,
           });
-          const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `vercel:${deployment.uid}:task:${task.id}` });
-          await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, status: call.status, taskRunId: run.id });
+          const call = await createCalleCall({ task: briefing, phone: task.action.phone, userId: task.userId, eventId: `vercel:${deployment.uid}:task:${task.id}`, source: "vercel" });
+          await saveCallTask({ id: call.id, userId: task.userId, task: briefing, phone: task.action.phone, source: "vercel", status: call.status, taskRunId: run.id });
           await markTaskRunDispatched(run.id, call.id);
         } catch (error) {
           failed = true;
-          await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null);
+          await markTaskRunFailed(run.id, error instanceof Error ? error.message : String(error), null, calleProviderError(error));
         }
       }
       await advanceSourceEvent(eventId, failed ? "One or more CALL-E calls failed" : undefined, null);

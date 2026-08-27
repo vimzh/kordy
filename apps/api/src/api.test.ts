@@ -2,8 +2,8 @@ import { afterAll, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { eq } from "drizzle-orm";
 import server from "./index";
-import { db } from "./db";
-import { users } from "./schema";
+import { db, saveCallTask, upsertUser } from "./db";
+import { callTasks, users } from "./schema";
 
 const userId = "api-contract-test";
 process.env.TWELVE_DATA_API_KEY = "test-key";
@@ -14,6 +14,7 @@ function authCookie() {
 }
 
 afterAll(async () => {
+  await db.delete(callTasks).where(eq(callTasks.userId, userId));
   await db.delete(users).where(eq(users.id, userId));
 });
 
@@ -65,4 +66,87 @@ test("rejects unknown CALL-E webhook ids before making a provider API request", 
     body: JSON.stringify({ id: "event-unknown", data: { id: "call_unknown" } }),
   }));
   expect(response.status).toBe(404);
+});
+
+test("validates and persists CALL-E calling preferences", async () => {
+  const response = await server.fetch(new Request("http://localhost/profile", {
+    method: "PATCH",
+    headers: { Cookie: authCookie(), "Content-Type": "application/json" },
+    body: JSON.stringify({ defaultPhone: "+919876543210", callRegion: "in", callLocale: "hi-in" }),
+  }));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ profile: { defaultPhone: "+919876543210", callRegion: "IN", callLocale: "hi-IN" } });
+
+  const invalid = await server.fetch(new Request("http://localhost/profile", {
+    method: "PATCH",
+    headers: { Cookie: authCookie(), "Content-Type": "application/json" },
+    body: JSON.stringify({ callRegion: "ZZ" }),
+  }));
+  expect(invalid.status).toBe(400);
+});
+
+test("persists terminal CALL-E evidence without placing a call", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.CALLE_API_KEY;
+  process.env.CALLE_API_KEY = "test-key";
+  await upsertUser({ sub: userId, email: "api@example.com", name: "API Test" });
+  await saveCallTask({ id: "call_observability", userId, task: "Weather alert", phone: "+919876543210", source: "weather", status: "queued" });
+  globalThis.fetch = (async (_input, _init) => Response.json({
+    id: "call_observability",
+    status: "completed",
+    task: "Weather alert",
+    summary: "The recipient acknowledged the alert.",
+    structured_result: { requested_action: "acknowledge", weather_alert_response: "acknowledged", action_details: "", evidence: "The recipient said okay." },
+    task_completed: true,
+    completion_confidence: { score: 0.94, label: "high" },
+    evidence: ["The recipient said okay."],
+    recipients: [{
+      id: "rcp_1",
+      phones: ["+919876543210"],
+      locale: "hi-IN",
+      region: "IN",
+      status: "completed",
+      structured_result: { answered_by: "human", evidence: "The intended recipient spoke." },
+      summary: "The recipient acknowledged the alert.",
+      attempts: [{
+        id: "att_1",
+        phone: "+919876543210",
+        status: "completed",
+        started_at: "2026-08-27T10:00:00Z",
+        completed_at: "2026-08-27T10:00:20Z",
+        summary: "Alert acknowledged.",
+        transcript_turns: [{ offset_seconds: 0, speaker: "bot", text: "Hi, it's Kordy." }, { offset_seconds: 4, speaker: "user", text: "Okay, thanks." }],
+        provider_call_id: "provider_1",
+        failure_code: null,
+        failure_message: null,
+      }],
+    }],
+    failure_code: null,
+    failure_message: null,
+    completed_at: "2026-08-27T10:00:20Z",
+  })) as typeof fetch;
+
+  try {
+    const response = await server.fetch(new Request("http://localhost/webhooks/calle", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "CALL-E-Event-Id": "evt_observability" },
+      body: JSON.stringify({ id: "evt_observability", data: { id: "call_observability" } }),
+    }));
+    expect(response.status).toBe(200);
+    const [stored] = await db.select().from(callTasks).where(eq(callTasks.id, "call_observability"));
+    expect(stored).toMatchObject({
+      status: "completed",
+      taskCompleted: true,
+      completionConfidence: { score: 0.94, label: "high" },
+      evidence: ["The recipient said okay."],
+      answeredBy: "human",
+      region: "IN",
+      locale: "hi-IN",
+      providerEventId: "evt_observability",
+    });
+    expect((stored?.recipients as Array<{ attempts: Array<{ transcript_turns: unknown[] }> }>)[0]?.attempts[0]?.transcript_turns).toHaveLength(2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.CALLE_API_KEY; else process.env.CALLE_API_KEY = originalKey;
+  }
 });
