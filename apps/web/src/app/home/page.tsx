@@ -2,6 +2,7 @@ import { headers } from "next/headers";
 import { SidebarProvider } from "@/components/ui/sidebar";
 import { AppSidebar } from "@/components/AppSidebar";
 import type { Contact } from "@/components/ContactsTable";
+import { OnboardingChecklist } from "@/components/OnboardingChecklist";
 import { TriggerLogs } from "@/components/TriggerLogs";
 import { requireSession } from "@/lib/auth";
 
@@ -26,6 +27,7 @@ export default async function HomePage() {
               Describe what should trigger a call, then press Enter.
             </p>
           </div>
+          <OnboardingChecklist />
           <TriggerLogs contacts={contacts} />
         </div>
       </main>

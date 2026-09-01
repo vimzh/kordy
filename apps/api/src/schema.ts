@@ -7,6 +7,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  real,
   text,
   timestamp,
   uniqueIndex,
@@ -24,8 +25,11 @@ export const users = pgTable("users", {
   name: text("name"),
   picture: text("picture"),
   defaultPhone: varchar("default_phone", { length: 16 }),
+  outboundCallConsentAt: timestamp("outbound_call_consent_at", { withTimezone: true, mode: "string" }),
+  phoneVerifiedAt: timestamp("phone_verified_at", { withTimezone: true, mode: "string" }),
   callRegion: varchar("call_region", { length: 2 }),
   callLocale: varchar("call_locale", { length: 35 }),
+  approvalExpiryMinutes: integer("approval_expiry_minutes").default(60).notNull(),
   ...timestamps,
 });
 
@@ -113,7 +117,8 @@ export const tasks = pgTable("tasks", {
   userId: text("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
   requestId: text("request_id").notNull(),
   originalPrompt: text("original_prompt").notNull(),
-  status: text("status").$type<"creating" | "parsing" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed">().notNull(),
+  name: varchar("name", { length: 120 }).notNull(),
+  status: text("status").$type<"creating" | "parsing" | "draft" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed">().notNull(),
   schemaVersion: integer("schema_version").default(1).notNull(),
   gmailConnectionId: text("gmail_connection_id").references(() => gmailConnections.id, { onDelete: "set null" }),
   vercelConnectionId: text("vercel_connection_id").references(() => vercelConnections.id, { onDelete: "set null" }),
@@ -126,12 +131,26 @@ export const tasks = pgTable("tasks", {
   clarificationQuestion: text("clarification_question"),
   clarificationContext: jsonb("clarification_context"),
   parserModel: text("parser_model").notNull(),
+  parserConfidence: real("parser_confidence"),
+  parserAmbiguity: text("parser_ambiguity"),
+  delivery: jsonb("delivery").$type<{
+    timezone?: string;
+    quietHoursStart?: string;
+    quietHoursEnd?: string;
+    cooldownMinutes?: number;
+    maxCallsPerHour?: number;
+    maxCallsPerDay?: number;
+    startsAt?: string;
+    expiresAt?: string;
+    locale?: string;
+    region?: string;
+  }>().default({}).notNull(),
   executionMode: text("execution_mode").$type<"automatic" | "approval">().default("automatic").notNull(),
   activationAt: timestamp("activation_at", { withTimezone: true, mode: "string" }),
   ...timestamps,
 }, (table) => [
   uniqueIndex("tasks_user_id_request_id_key").on(table.userId, table.requestId),
-  check("tasks_status_check", sql`${table.status} in ('creating', 'parsing', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed')`),
+  check("tasks_status_check", sql`${table.status} in ('creating', 'parsing', 'draft', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed')`),
 ]);
 
 export const sourceEvents = pgTable("source_events", {
@@ -193,6 +212,10 @@ export const taskRuns = pgTable("task_runs", {
     retryAfterSeconds: number | null;
   }>(),
   approvalStatus: varchar("approval_status", { length: 20 }).default("not_required").notNull(),
+  approvalExpiresAt: timestamp("approval_expires_at", { withTimezone: true, mode: "string" }),
+  approvalDecidedAt: timestamp("approval_decided_at", { withTimezone: true, mode: "string" }),
+  approvalDecidedBy: text("approval_decided_by").references(() => users.id, { onDelete: "set null" }),
+  approvalViewedAt: timestamp("approval_viewed_at", { withTimezone: true, mode: "string" }),
   attempts: integer("attempts").default(0).notNull(),
   availableAt: timestamp("available_at", { withTimezone: true, mode: "string" }).defaultNow(),
   ...timestamps,
@@ -225,6 +248,15 @@ export const callTasks = pgTable("call_tasks", {
   replyStatus: varchar("reply_status", { length: 20 }).default("not_requested").notNull(),
   replyMessageId: text("reply_message_id"),
   replyError: text("reply_error"),
+  reconciliationAttempts: integer("reconciliation_attempts").default(0).notNull(),
+  reconcileAvailableAt: timestamp("reconcile_available_at", { withTimezone: true, mode: "string" }).defaultNow(),
+  providerError: jsonb("provider_error").$type<{
+    status: number | null;
+    code: string;
+    message: string;
+    details: Record<string, unknown>;
+    retryAfterSeconds: number | null;
+  }>(),
   ...timestamps,
 }, (table) => [
   uniqueIndex("call_tasks_run_key").on(table.taskRunId).where(sql`${table.taskRunId} is not null`),

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import {
-  buildCalleRequest, CalleApiError, calleSources, confirmedReplyInstruction, createCalleCall,
+  buildCalleRequest, CalleApiError, calleSources, confirmedPhoneOwnership, confirmedReplyInstruction, createCalleCall,
   getCalleCall, normalizeCallLocale, normalizeCallRegion, normalizePhone, resolveCalleRecipient,
   type CalleSource,
 } from "./calle";
@@ -28,6 +28,23 @@ test("requires a human, high confidence, and explicit confirmation before sendin
   expect(confirmedReplyInstruction({ ...result, send_confirmed: "unknown" }, { score: 0.99, label: "high" }, "human", true)).toBeNull();
 });
 
+test("accepts phone ownership only from a completed, high-confidence human confirmation", () => {
+  const call = {
+    id: "call_verify",
+    status: "completed",
+    task: "Verify phone ownership",
+    structured_result: { requested_action: "confirm_ownership", ownership_confirmed: "yes", evidence: "The recipient explicitly confirmed ownership." },
+    task_completed: true,
+    completion_confidence: { score: 0.92, label: "high" },
+    recipients: [{ id: "recipient", phones: ["+919876543210"], locale: "en-IN", region: "IN", status: "completed", structured_result: { answered_by: "human", evidence: "The intended recipient answered." }, summary: null, attempts: [] }],
+  };
+  expect(confirmedPhoneOwnership(call)).toBe(true);
+  expect(confirmedPhoneOwnership({ ...call, status: "calling" })).toBe(false);
+  expect(confirmedPhoneOwnership({ ...call, completion_confidence: { score: 0.79, label: "high" } })).toBe(false);
+  expect(confirmedPhoneOwnership({ ...call, structured_result: { ...call.structured_result, ownership_confirmed: "unknown" } })).toBe(false);
+  expect(confirmedPhoneOwnership({ ...call, recipients: [{ ...call.recipients[0]!, structured_result: { answered_by: "voicemail", evidence: "Voicemail answered." } }] })).toBe(false);
+});
+
 test("builds a strict source-specific result schema for every workflow", () => {
   const outcomeFields: Record<CalleSource, string> = {
     gmail: "send_confirmed",
@@ -43,6 +60,7 @@ test("builds a strict source-specific result schema for every workflow", () => {
     nasa: "natural_event_response",
     fx: "rate_alert_response",
     india: "market_alert_response",
+    verification: "ownership_confirmed",
     generic: "alert_response",
   };
 
@@ -118,5 +136,28 @@ test("preserves stable CALL-E error codes and Retry-After", async () => {
   } finally {
     globalThis.fetch = originalFetch;
     if (originalKey === undefined) delete process.env.CALLE_API_KEY; else process.env.CALLE_API_KEY = originalKey;
+  }
+});
+
+test("honors HTTP-date Retry-After on call creation", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.CALLE_API_KEY;
+  const originalWebhook = process.env.CALLE_WEBHOOK_URL;
+  const retryAt = new Date(Date.now() + 10_000);
+  process.env.CALLE_API_KEY = "test-key";
+  process.env.CALLE_WEBHOOK_URL = "https://kordy.example/webhooks/calle";
+  globalThis.fetch = (async (_input, _init) => Response.json({
+    error: { code: "rate_limit_exceeded", message: "Try later.", details: {} },
+  }, { status: 429, headers: { "Retry-After": retryAt.toUTCString() } })) as typeof fetch;
+
+  try {
+    const error = await createCalleCall({ task: "Call me", phone: "+919876543210", userId: "user-1", eventId: "event-1", source: "generic" }).catch((value) => value);
+    expect(error).toBeInstanceOf(CalleApiError);
+    expect((error as CalleApiError).retryAfterMs).toBeGreaterThanOrEqual(8_000);
+    expect((error as CalleApiError).retryAfterMs).toBeLessThanOrEqual(10_000);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.CALLE_API_KEY; else process.env.CALLE_API_KEY = originalKey;
+    if (originalWebhook === undefined) delete process.env.CALLE_WEBHOOK_URL; else process.env.CALLE_WEBHOOK_URL = originalWebhook;
   }
 });

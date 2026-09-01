@@ -15,6 +15,25 @@ const sign = (value: string, secret: string) => createHmac("sha256", secret).upd
 export const sessionCookie = (name: string, value: string, maxAge: number) => `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`;
 const required = (values: Record<string, string | undefined>) => { const missing = Object.entries(values).filter(([, value]) => !value).map(([key]) => key); if (missing.length) throw new Error(`Missing OAuth configuration: ${missing.join(", ")}`); };
 
+export function validReturnTo(value: string | undefined) {
+  if (!value || value.length > 500 || !value.startsWith("/") || value.startsWith("//") || value.includes("\\") || /[\u0000-\u001f\u007f]/.test(value)) return null;
+  return value;
+}
+
+export function oauthReturnTo(c: Context, cookieName: string, fallback: string) {
+  const encoded = cookieValue(c.req.header("Cookie"), cookieName);
+  if (!encoded) return fallback;
+  try {
+    return validReturnTo(decodeURIComponent(encoded)) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+export function setOAuthReturnTo(c: Context, cookieName: string, value: string | undefined) {
+  c.header("Set-Cookie", sessionCookie(cookieName, encodeURIComponent(validReturnTo(value) ?? ""), 600), { append: true });
+}
+
 export function startGoogleAuth(c: Context) {
   const config = env(); required({ GOOGLE_CLIENT_ID: config.clientId, SESSION_SECRET: config.sessionSecret });
   const state = randomBytes(24).toString("base64url");

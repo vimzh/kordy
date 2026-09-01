@@ -1,6 +1,6 @@
 // PostgreSQL persistence for users, Gmail task definitions, durable events, runs, and calls.
 import { SQL } from "bun";
-import { and, desc, eq, ilike, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, ilike, inArray, isNotNull, isNull, lt, lte, ne, or, sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sql";
 import { alias } from "drizzle-orm/pg-core";
 import { callTasks, contacts, gmailConnections, integrationConnections, notionConnections, sourceEvents, taskRuns, tasks, users, vercelConnections } from "./schema";
@@ -117,6 +117,20 @@ export type CallProfileUpdate = {
   defaultPhone?: string | null;
   callRegion?: string | null;
   callLocale?: string | null;
+  approvalExpiryMinutes?: number;
+};
+
+export type TaskDelivery = {
+  timezone?: string;
+  quietHoursStart?: string;
+  quietHoursEnd?: string;
+  cooldownMinutes?: number;
+  maxCallsPerHour?: number;
+  maxCallsPerDay?: number;
+  startsAt?: string;
+  expiresAt?: string;
+  locale?: string;
+  region?: string;
 };
 
 export type Task = {
@@ -127,12 +141,16 @@ export type Task = {
   notionConnectionId: string | null;
   integrationConnectionId: string | null;
   originalPrompt: string;
-  status: "creating" | "parsing" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed";
+  name: string;
+  status: "creating" | "parsing" | "draft" | "active" | "needs_clarification" | "paused" | "archived" | "parse_failed";
   trigger: TaskTrigger | null;
   action: TaskAction | null;
   clarificationQuestion: string | null;
   clarificationContext: unknown;
   parserModel: string;
+  parserConfidence: number | null;
+  parserAmbiguity: string | null;
+  delivery: TaskDelivery;
   executionMode: "automatic" | "approval";
   publicSourceState: PublicSourceState | null;
   lastPolledAt: string | null;
@@ -206,19 +224,6 @@ if (!databaseUrl) throw new Error("Missing DATABASE_URL");
 const client = new SQL({ url: databaseUrl, max: 2 });
 export const db = drizzle({ client });
 
-const demoContacts = [
-  ["Aarav Mehta", "Founder building finance tools for independent retailers.", "+919876543210", "aarav@example.com"],
-  ["Maya Chen", "Product lead evaluating workflow automation for her operations team.", "+14155550136", "maya@example.com"],
-  ["Noah Williams", "Angel investor focused on early-stage developer infrastructure.", "+442079460182", "noah@example.com"],
-  ["Sofia Ramirez", "Operations director modernising customer support workflows.", "+12025550101", "sofia@example.com"],
-  ["Ethan Brooks", "Engineering manager responsible for platform reliability.", "+12025550102", "ethan@example.com"],
-  ["Priya Shah", "Growth lead running partnerships for a B2B software company.", "+12025550103", "priya@example.com"],
-  ["Lucas Martin", "Independent consultant helping startups improve sales operations.", "+12025550104", "lucas@example.com"],
-  ["Amara Okafor", "Community founder organising events for product builders.", "+12025550105", "amara@example.com"],
-  ["Daniel Kim", "Security lead monitoring infrastructure and incident response.", "+12025550106", "daniel@example.com"],
-  ["Elena Petrova", "Customer success manager overseeing strategic accounts.", "+12025550107", "elena@example.com"],
-] as const;
-
 export async function initializeDatabase() {
   await db.execute(sql.raw(`
     CREATE TABLE IF NOT EXISTS users (
@@ -227,13 +232,19 @@ export async function initializeDatabase() {
       name TEXT,
       picture TEXT,
       default_phone VARCHAR(16),
+      outbound_call_consent_at TIMESTAMPTZ,
+      phone_verified_at TIMESTAMPTZ,
       call_region VARCHAR(2),
       call_locale VARCHAR(35),
+      approval_expiry_minutes INTEGER NOT NULL DEFAULT 60,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS call_region VARCHAR(2);
     ALTER TABLE users ADD COLUMN IF NOT EXISTS call_locale VARCHAR(35);
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS outbound_call_consent_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_verified_at TIMESTAMPTZ;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS approval_expiry_minutes INTEGER NOT NULL DEFAULT 60;
 
     CREATE TABLE IF NOT EXISTS contacts (
       id BIGSERIAL PRIMARY KEY,
@@ -313,7 +324,8 @@ export async function initializeDatabase() {
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       request_id TEXT NOT NULL,
       original_prompt TEXT NOT NULL,
-      status TEXT NOT NULL CHECK (status IN ('creating', 'parsing', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed')),
+      name VARCHAR(120) NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('creating', 'parsing', 'draft', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed')),
       schema_version INTEGER NOT NULL DEFAULT 1,
       gmail_connection_id TEXT REFERENCES gmail_connections(user_id) ON DELETE SET NULL,
       trigger JSONB,
@@ -333,8 +345,14 @@ export async function initializeDatabase() {
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS integration_connection_id TEXT REFERENCES integration_connections(id) ON DELETE SET NULL;
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS public_source_state JSONB;
     ALTER TABLE tasks ADD COLUMN IF NOT EXISTS last_polled_at TIMESTAMPTZ;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS name VARCHAR(120);
+    UPDATE tasks SET name = LEFT(original_prompt, 120) WHERE name IS NULL;
+    ALTER TABLE tasks ALTER COLUMN name SET NOT NULL;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parser_confidence REAL;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parser_ambiguity TEXT;
+    ALTER TABLE tasks ADD COLUMN IF NOT EXISTS delivery JSONB NOT NULL DEFAULT '{}';
     ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_status_check;
-    ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('creating', 'parsing', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed'));
+    ALTER TABLE tasks ADD CONSTRAINT tasks_status_check CHECK (status IN ('creating', 'parsing', 'draft', 'active', 'needs_clarification', 'paused', 'archived', 'parse_failed'));
 
     CREATE TABLE IF NOT EXISTS source_events (
       id TEXT PRIMARY KEY,
@@ -409,6 +427,13 @@ export async function initializeDatabase() {
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_status VARCHAR(20) NOT NULL DEFAULT 'not_required';
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS available_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
     ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_error JSONB;
+    ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_expires_at TIMESTAMPTZ;
+    ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_decided_at TIMESTAMPTZ;
+    ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_decided_by TEXT REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS approval_viewed_at TIMESTAMPTZ;
+    UPDATE task_runs r SET approval_expires_at = r.created_at + make_interval(mins => u.approval_expiry_minutes)
+      FROM tasks t JOIN users u ON u.id = t.user_id
+      WHERE r.task_id = t.id AND r.approval_status = 'pending' AND r.approval_expires_at IS NULL;
     ALTER TABLE task_runs ALTER COLUMN available_at DROP NOT NULL;
 
     CREATE TABLE IF NOT EXISTS call_tasks (
@@ -438,6 +463,9 @@ export async function initializeDatabase() {
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS failure_message TEXT;
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS provider_event_id TEXT;
     ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reconciliation_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS reconcile_available_at TIMESTAMPTZ DEFAULT NOW();
+    ALTER TABLE call_tasks ADD COLUMN IF NOT EXISTS provider_error JSONB;
     CREATE UNIQUE INDEX IF NOT EXISTS call_tasks_run_key ON call_tasks(task_run_id) WHERE task_run_id IS NOT NULL;
 
     CREATE TABLE IF NOT EXISTS call_dispatch_reservations (
@@ -456,31 +484,43 @@ export async function upsertUser(user: { sub: string; email?: string; name?: str
       target: users.id,
       set: { email: user.email, name: user.name, picture: user.picture, updatedAt: sql`now()` },
     });
-  const hasContacts = await db.select({ id: contacts.id }).from(contacts).where(eq(contacts.userId, user.sub)).limit(1);
-  if (hasContacts.length) return;
-  await db.insert(contacts).values(demoContacts.map(([name, summary, phone, email]) => ({
-    userId: user.sub, name, summary, phone, email,
-  }))).onConflictDoNothing({ target: [contacts.userId, contacts.phone] });
 }
 
 export async function getProfile(userId: string) {
   const [profile] = await db.select({
     email: users.email, name: users.name, picture: users.picture, defaultPhone: users.defaultPhone,
-    callRegion: users.callRegion, callLocale: users.callLocale,
+    outboundCallConsentAt: users.outboundCallConsentAt, phoneVerifiedAt: users.phoneVerifiedAt,
+    callRegion: users.callRegion, callLocale: users.callLocale, approvalExpiryMinutes: users.approvalExpiryMinutes,
   }).from(users).where(eq(users.id, userId)).limit(1);
   return profile ?? null;
 }
 
 export async function updateProfile(userId: string, update: CallProfileUpdate) {
   const [profile] = await db.update(users).set({
-    ...(update.defaultPhone !== undefined ? { defaultPhone: update.defaultPhone } : {}),
+    ...(update.defaultPhone !== undefined ? {
+      defaultPhone: update.defaultPhone,
+      phoneVerifiedAt: sql`CASE WHEN ${users.defaultPhone} IS DISTINCT FROM ${update.defaultPhone} THEN NULL ELSE ${users.phoneVerifiedAt} END`,
+    } : {}),
     ...(update.callRegion !== undefined ? { callRegion: update.callRegion } : {}),
     ...(update.callLocale !== undefined ? { callLocale: update.callLocale } : {}),
+    ...(update.approvalExpiryMinutes !== undefined ? { approvalExpiryMinutes: update.approvalExpiryMinutes } : {}),
     updatedAt: sql`now()`,
   }).where(eq(users.id, userId)).returning({
     email: users.email, name: users.name, picture: users.picture, defaultPhone: users.defaultPhone,
-    callRegion: users.callRegion, callLocale: users.callLocale,
+    outboundCallConsentAt: users.outboundCallConsentAt, phoneVerifiedAt: users.phoneVerifiedAt,
+    callRegion: users.callRegion, callLocale: users.callLocale, approvalExpiryMinutes: users.approvalExpiryMinutes,
   });
+  return profile ?? null;
+}
+
+export async function updateOutboundCallConsent(userId: string, accepted: boolean) {
+  await db.update(users).set({ outboundCallConsentAt: accepted ? sql`now()` : null, updatedAt: sql`now()` }).where(eq(users.id, userId));
+  return getProfile(userId);
+}
+
+export async function markDefaultPhoneVerified(userId: string, phone: string) {
+  const [profile] = await db.update(users).set({ phoneVerifiedAt: sql`now()`, updatedAt: sql`now()` })
+    .where(and(eq(users.id, userId), eq(users.defaultPhone, phone))).returning({ phoneVerifiedAt: users.phoneVerifiedAt });
   return profile ?? null;
 }
 
@@ -530,8 +570,8 @@ export async function getTask(userId: string, id: string) {
   return task ?? null;
 }
 
-export async function listTasks(userId: string) {
-  return taskQuery(userId);
+export async function listTasks(userId: string, options: { status?: Task["status"][]; search?: string } = {}) {
+  return taskQuery(userId, undefined, undefined, options);
 }
 
 export async function taskCreationCapacity(userId: string) {
@@ -546,9 +586,9 @@ export async function taskCreationCapacity(userId: string) {
 
 export async function listActiveWorkerTasks(gmailConnectionId: string) {
   const rows = await db.select({
-    id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt, trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt,
+    id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt, trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt, delivery: tasks.delivery,
   }).from(tasks).where(and(eq(tasks.gmailConnectionId, gmailConnectionId), eq(tasks.status, "active")));
-  return rows.map(({ id, userId: ownerId, originalPrompt, trigger, action, activationAt }) => {
+  return rows.map(({ id, userId: ownerId, originalPrompt, trigger, action, activationAt, delivery }) => {
     const parsedTrigger = trigger as GmailTaskTrigger;
     const parsedAction = action as TaskAction;
     return {
@@ -559,6 +599,7 @@ export async function listActiveWorkerTasks(gmailConnectionId: string) {
     phone: parsedAction.phone,
     executionMode: parsedAction.executionMode ?? "automatic",
     activationAt: activationAt ?? undefined,
+    delivery,
     senders: parsedTrigger.senders,
     subjectKeywords: parsedTrigger.subjectKeywords,
     bodyKeywords: parsedTrigger.bodyKeywords,
@@ -574,36 +615,49 @@ const taskSelection = {
   notionConnectionId: tasks.notionConnectionId,
   integrationConnectionId: tasks.integrationConnectionId,
   originalPrompt: tasks.originalPrompt,
+  name: tasks.name,
   status: tasks.status,
   trigger: tasks.trigger,
   action: tasks.action,
   clarificationQuestion: tasks.clarificationQuestion,
   clarificationContext: tasks.clarificationContext,
   parserModel: tasks.parserModel,
+  parserConfidence: tasks.parserConfidence,
+  parserAmbiguity: tasks.parserAmbiguity,
+  delivery: tasks.delivery,
   executionMode: tasks.executionMode,
   publicSourceState: tasks.publicSourceState,
   lastPolledAt: tasks.lastPolledAt,
   createdAt: tasks.createdAt,
   updatedAt: tasks.updatedAt,
+  connection: sql<{ id: string; provider: string; label: string } | null>`case
+    when ${tasks.gmailConnectionId} is not null then jsonb_build_object('id', ${tasks.gmailConnectionId}, 'provider', 'gmail', 'label', (select gmail_address from gmail_connections where id = ${tasks.gmailConnectionId}))
+    when ${tasks.vercelConnectionId} is not null then jsonb_build_object('id', ${tasks.vercelConnectionId}, 'provider', 'vercel', 'label', (select account_name from vercel_connections where id = ${tasks.vercelConnectionId}))
+    when ${tasks.notionConnectionId} is not null then jsonb_build_object('id', ${tasks.notionConnectionId}, 'provider', 'notion', 'label', (select workspace_name from notion_connections where id = ${tasks.notionConnectionId}))
+    when ${tasks.integrationConnectionId} is not null then (select jsonb_build_object('id', id, 'provider', provider, 'label', label) from integration_connections where id = ${tasks.integrationConnectionId})
+    else null end`,
 };
 
-async function taskQuery(userId: string, id?: string, requestId?: string): Promise<Task[]> {
+async function taskQuery(userId: string, id?: string, requestId?: string, options: { status?: Task["status"][]; search?: string } = {}): Promise<Task[]> {
   const filters = [eq(tasks.userId, userId)];
   if (id) filters.push(eq(tasks.id, id));
   if (requestId) filters.push(eq(tasks.requestId, requestId));
+  if (options.status?.length) filters.push(inArray(tasks.status, options.status));
+  if (options.search) filters.push(or(ilike(tasks.name, `%${options.search}%`), ilike(tasks.originalPrompt, `%${options.search}%`))!);
   const rows = await db.select(taskSelection).from(tasks).where(and(...filters)).orderBy(desc(tasks.createdAt));
   return rows.map((row) => ({ ...row, trigger: row.trigger as TaskTrigger | null, action: row.action as TaskAction | null }));
 }
 
 export async function createTask(input: {
   id: string; userId: string; requestId: string; prompt: string; status: Task["status"];
-  gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null; trigger?: TaskTrigger | null; action?: TaskAction | null; question?: string | null; context?: unknown; parserModel: string; executionMode?: "automatic" | "approval";
+  name?: string; gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null; trigger?: TaskTrigger | null; action?: TaskAction | null; question?: string | null; context?: unknown; parserModel: string; executionMode?: "automatic" | "approval"; delivery?: TaskDelivery;
 }) {
   await db.insert(tasks).values({
     id: input.id,
     userId: input.userId,
     requestId: input.requestId,
     originalPrompt: input.prompt,
+    name: input.name ?? input.prompt.slice(0, 120),
     status: input.status,
     gmailConnectionId: input.gmailConnectionId ?? null,
     vercelConnectionId: input.vercelConnectionId ?? null,
@@ -614,6 +668,7 @@ export async function createTask(input: {
     clarificationQuestion: input.question ?? null,
     clarificationContext: input.context ?? null,
     parserModel: input.parserModel,
+    delivery: input.delivery ?? {},
     executionMode: input.executionMode ?? "automatic",
     activationAt: input.status === "active" ? new Date().toISOString() : null,
   }).onConflictDoNothing({ target: [tasks.userId, tasks.requestId] });
@@ -635,8 +690,8 @@ export async function claimTaskCreation() {
   return rows[0] ?? null;
 }
 
-export async function completeTaskCreation(input: { id: string; trigger?: TaskTrigger; action?: TaskAction; question?: string; context?: unknown; parserModel: string }) {
-  const status = input.question ? "needs_clarification" : "active";
+export async function completeTaskCreation(input: { id: string; trigger?: TaskTrigger; action?: TaskAction; question?: string; context?: unknown; parserModel: string; confidence?: number; ambiguity?: string | null }) {
+  const status = input.question ? "needs_clarification" : "draft";
   await db.update(tasks).set({
     status,
     trigger: input.trigger ?? null,
@@ -644,7 +699,9 @@ export async function completeTaskCreation(input: { id: string; trigger?: TaskTr
     clarificationQuestion: input.question ?? null,
     clarificationContext: input.context ?? null,
     parserModel: input.parserModel,
-    activationAt: status === "active" ? sql`now()` : null,
+    parserConfidence: input.confidence ?? (input.question ? 0.5 : 1),
+    parserAmbiguity: input.ambiguity ?? input.question ?? null,
+    activationAt: null,
     updatedAt: sql`now()`,
   }).where(and(eq(tasks.id, input.id), eq(tasks.status, "parsing")));
 }
@@ -657,7 +714,7 @@ export async function failTaskCreation(id: string, parserModel: string, error: s
 export async function resolveTaskClarification(input: { id: string; userId: string; gmailConnectionId?: string | null; vercelConnectionId?: string | null; notionConnectionId?: string | null; integrationConnectionId?: string | null; prompt: string; trigger: TaskTrigger; action: TaskAction; parserModel: string }) {
   const [task] = await db.update(tasks).set({
     originalPrompt: input.prompt,
-    status: "active",
+    status: "draft",
     gmailConnectionId: input.gmailConnectionId ?? null,
     vercelConnectionId: input.vercelConnectionId ?? null,
     notionConnectionId: input.notionConnectionId ?? null,
@@ -667,7 +724,9 @@ export async function resolveTaskClarification(input: { id: string; userId: stri
     clarificationQuestion: null,
     clarificationContext: null,
     parserModel: input.parserModel,
-    activationAt: sql`now()`,
+    parserConfidence: 1,
+    parserAmbiguity: null,
+    activationAt: null,
     updatedAt: sql`now()`,
   }).where(and(eq(tasks.id, input.id), eq(tasks.userId, input.userId), eq(tasks.status, "needs_clarification"))).returning(taskSelection);
   return task ? { ...task, trigger: task.trigger as TaskTrigger, action: task.action as TaskAction } : null;
@@ -681,9 +740,75 @@ export async function updateTaskClarification(userId: string, id: string, questi
 }
 
 export async function updateTaskStatus(userId: string, id: string, status: "active" | "paused" | "archived") {
-  const [task] = await db.update(tasks).set({ status, updatedAt: sql`now()` })
-    .where(and(eq(tasks.id, id), eq(tasks.userId, userId), ne(tasks.status, "needs_clarification"))).returning(taskSelection);
+  const [task] = await db.update(tasks).set({ status, activationAt: status === "active" ? sql`coalesce(${tasks.activationAt}, now())` : tasks.activationAt, updatedAt: sql`now()` })
+    .where(and(eq(tasks.id, id), eq(tasks.userId, userId), status === "archived" ? sql`true` : ne(tasks.status, "needs_clarification"), status === "active" ? and(isNotNull(tasks.trigger), isNotNull(tasks.action)) : sql`true`)).returning(taskSelection);
   return task ? { ...task, trigger: task.trigger as TaskTrigger | null, action: task.action as TaskAction | null } : null;
+}
+
+export async function updateTask(userId: string, id: string, update: { name?: string; trigger?: TaskTrigger; action?: TaskAction; executionMode?: "automatic" | "approval"; delivery?: TaskDelivery }) {
+  const values = {
+    ...update,
+    ...(update.executionMode && !update.action ? { action: sql`case when ${tasks.action} is null then null else jsonb_set(${tasks.action}, '{executionMode}', to_jsonb(${update.executionMode}::text), true) end` } : {}),
+    updatedAt: sql`now()`,
+  };
+  const [task] = await db.update(tasks).set(values).where(and(eq(tasks.id, id), eq(tasks.userId, userId))).returning(taskSelection);
+  return task ? { ...task, trigger: task.trigger as TaskTrigger | null, action: task.action as TaskAction | null } : null;
+}
+
+export async function duplicateTask(userId: string, id: string, duplicateId: string, requestId: string) {
+  const task = await getTask(userId, id);
+  if (!task) return null;
+  return createTask({ ...task, id: duplicateId, requestId, prompt: task.originalPrompt, name: `${task.name} copy`.slice(0, 120), status: "draft", parserModel: task.parserModel, delivery: task.delivery });
+}
+
+export async function deleteTask(userId: string, id: string) {
+  const [deleted] = await db.delete(tasks).where(and(eq(tasks.id, id), eq(tasks.userId, userId))).returning({ id: tasks.id });
+  return deleted ?? null;
+}
+
+export async function retryTaskCreation(userId: string, id: string) {
+  const [task] = await db.update(tasks).set({ status: "creating", clarificationQuestion: null, clarificationContext: null, parserAmbiguity: null, updatedAt: sql`now()` })
+    .where(and(eq(tasks.id, id), eq(tasks.userId, userId), or(eq(tasks.status, "parse_failed"), eq(tasks.status, "needs_clarification")))).returning(taskSelection);
+  return task ? { ...task, trigger: task.trigger as TaskTrigger | null, action: task.action as TaskAction | null } : null;
+}
+
+export async function taskDeliveryEligibility(taskId: string, now = new Date()): Promise<{ allowed: boolean; reason: string | null; nextEligibleAt: string | null; delivery: TaskDelivery }> {
+  const [task] = await db.select({ status: tasks.status, delivery: tasks.delivery }).from(tasks).where(eq(tasks.id, taskId)).limit(1);
+  if (!task || task.status !== "active") return { allowed: false, reason: "inactive", nextEligibleAt: null, delivery: task?.delivery ?? {} };
+  const delivery = task.delivery ?? {};
+  const startsAt = delivery.startsAt ? new Date(delivery.startsAt) : null;
+  const expiresAt = delivery.expiresAt ? new Date(delivery.expiresAt) : null;
+  if (startsAt && startsAt > now) return { allowed: false, reason: "not_started", nextEligibleAt: startsAt.toISOString(), delivery };
+  if (expiresAt && expiresAt <= now) return { allowed: false, reason: "expired", nextEligibleAt: null, delivery };
+  if (delivery.quietHoursStart && delivery.quietHoursEnd) {
+    const parts = new Intl.DateTimeFormat("en-GB", { timeZone: delivery.timezone ?? "UTC", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(now);
+    const minutes = Number(parts.find((part) => part.type === "hour")?.value) * 60 + Number(parts.find((part) => part.type === "minute")?.value);
+    const parseTime = (time: string) => Number(time.slice(0, 2)) * 60 + Number(time.slice(3));
+    const start = parseTime(delivery.quietHoursStart);
+    const end = parseTime(delivery.quietHoursEnd);
+    const quiet = start < end ? minutes >= start && minutes < end : start > end && (minutes >= start || minutes < end);
+    if (quiet) {
+      // ponytail: minute arithmetic is deliberately simple; replace with Temporal when DST-boundary precision becomes material.
+      const remaining = (end - minutes + 1_440) % 1_440 || 1_440;
+      return { allowed: false, reason: "quiet_hours", nextEligibleAt: new Date(now.getTime() + remaining * 60_000).toISOString(), delivery };
+    }
+  }
+  const rows = await db.execute<{ lastCallAt: string | null; hourCount: number; dayCount: number; hourNext: string | null; dayNext: string | null }>(sql`
+    select max(c.created_at) as "lastCallAt",
+      count(*) filter (where c.created_at >= ${now.toISOString()}::timestamptz - interval '1 hour')::int as "hourCount",
+      count(*) filter (where c.created_at >= ${now.toISOString()}::timestamptz - interval '24 hours')::int as "dayCount",
+      min(c.created_at) filter (where c.created_at >= ${now.toISOString()}::timestamptz - interval '1 hour') + interval '1 hour' as "hourNext",
+      min(c.created_at) filter (where c.created_at >= ${now.toISOString()}::timestamptz - interval '24 hours') + interval '24 hours' as "dayNext"
+    from call_tasks c join task_runs r on r.id = c.task_run_id where r.task_id = ${taskId}
+  `);
+  const usage = rows[0] ?? { lastCallAt: null, hourCount: 0, dayCount: 0, hourNext: null, dayNext: null };
+  if (delivery.cooldownMinutes && usage.lastCallAt) {
+    const next = new Date(usage.lastCallAt).getTime() + delivery.cooldownMinutes * 60_000;
+    if (next > now.getTime()) return { allowed: false, reason: "cooldown", nextEligibleAt: new Date(next).toISOString(), delivery };
+  }
+  if (delivery.maxCallsPerHour !== undefined && usage.hourCount >= delivery.maxCallsPerHour) return { allowed: false, reason: "hourly_limit", nextEligibleAt: usage.hourNext, delivery };
+  if (delivery.maxCallsPerDay !== undefined && usage.dayCount >= delivery.maxCallsPerDay) return { allowed: false, reason: "daily_limit", nextEligibleAt: usage.dayNext, delivery };
+  return { allowed: true, reason: null, nextEligibleAt: null, delivery };
 }
 
 export async function claimPublicTaskForPolling() {
@@ -693,6 +818,7 @@ export async function claimPublicTaskForPolling() {
     originalPrompt: string;
     trigger: PublicTaskTrigger;
     action: TaskAction;
+    delivery: TaskDelivery;
     publicSourceState: PublicSourceState | null;
   }>(sql`
     WITH next AS (
@@ -719,7 +845,7 @@ export async function claimPublicTaskForPolling() {
     )
     UPDATE tasks t SET last_polled_at = NOW()
     FROM next WHERE t.id = next.id
-    RETURNING t.id, t.user_id AS "userId", t.original_prompt AS "originalPrompt", t.trigger, t.action,
+    RETURNING t.id, t.user_id AS "userId", t.original_prompt AS "originalPrompt", t.trigger, t.action, t.delivery,
       t.public_source_state AS "publicSourceState"
   `);
   return rows[0] ?? null;
@@ -731,7 +857,7 @@ export async function recordPublicSignal(task: {
   trigger: PublicTaskTrigger;
   action: TaskAction;
 }, signal: PublicSignal, state: PublicSourceState, fire: boolean) {
-  let run: { id: string } | undefined;
+  let run: { id: string; attempts: number } | undefined;
   if (fire) {
     const [event] = await db.insert(sourceEvents).values({
       id: randomId(),
@@ -752,8 +878,9 @@ export async function recordPublicSignal(task: {
       sourceEventId: event!.id,
       status: "pending",
       approvalStatus: task.action.executionMode === "approval" ? "pending" : "not_required",
+      approvalExpiresAt: task.action.executionMode === "approval" ? approvalDeadline(task.id) : null,
       matchingEvidence: [signal.summary, "source:public"],
-    }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
+    }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id, attempts: taskRuns.attempts });
   }
   await db.update(tasks).set({ publicSourceState: state }).where(eq(tasks.id, task.id));
   return run ? { ...run, awaitingApproval: task.action.executionMode === "approval" } : null;
@@ -774,10 +901,9 @@ export async function listGmailConnections(userId: string) {
   return db.select(gmailConnectionSelection).from(gmailConnections).where(eq(gmailConnections.userId, userId)).orderBy(desc(gmailConnections.createdAt));
 }
 
-export async function getGmailConnectionByAddress(gmailAddress: string) {
-  const [connection] = await db.select(gmailConnectionSelection).from(gmailConnections)
-    .where(and(ilike(gmailConnections.gmailAddress, gmailAddress), eq(gmailConnections.status, "connected"))).limit(1);
-  return connection ?? null;
+export function getGmailConnectionsByAddress(gmailAddress: string) {
+  return db.select(gmailConnectionSelection).from(gmailConnections)
+    .where(and(sql`lower(${gmailConnections.gmailAddress}) = lower(${gmailAddress})`, eq(gmailConnections.status, "connected")));
 }
 
 const gmailConnectionSelection = {
@@ -951,9 +1077,13 @@ export async function persistVercelDeployment(input: {
 export async function listActiveVercelTasks(connectionId: string) {
   const rows = await db.select({
     id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt,
-    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt,
+    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt, delivery: tasks.delivery,
   }).from(tasks).where(and(eq(tasks.vercelConnectionId, connectionId), eq(tasks.status, "active")));
   return rows.map((row) => ({ ...row, trigger: row.trigger as VercelTaskTrigger, action: row.action as TaskAction }));
+}
+
+function approvalDeadline(taskId: string) {
+  return sql`now() + make_interval(mins => coalesce((select u.approval_expiry_minutes from tasks t join users u on u.id = t.user_id where t.id = ${taskId}), 60))`;
 }
 
 export async function claimVercelTaskRun(input: { taskId: string; eventId: string; requiresApproval: boolean }) {
@@ -963,9 +1093,10 @@ export async function claimVercelTaskRun(input: { taskId: string; eventId: strin
     sourceEventId: input.eventId,
     status: "pending",
     approvalStatus: input.requiresApproval ? "pending" : "not_required",
+    approvalExpiresAt: input.requiresApproval ? approvalDeadline(input.taskId) : null,
     matchingEvidence: ["Vercel reported a failed deployment that matched the selected project and environment.", "source:vercel"],
   }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] })
-    .returning({ id: taskRuns.id });
+    .returning({ id: taskRuns.id, attempts: taskRuns.attempts });
   return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
 }
 
@@ -1069,7 +1200,7 @@ export async function persistNotionPage(input: {
 export async function listActiveNotionTasks(connectionId: string) {
   const rows = await db.select({
     id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt,
-    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt,
+    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt, delivery: tasks.delivery,
   }).from(tasks).where(and(eq(tasks.notionConnectionId, connectionId), eq(tasks.status, "active")));
   return rows.map((row) => ({ ...row, trigger: row.trigger as NotionTaskTrigger, action: row.action as TaskAction }));
 }
@@ -1081,8 +1212,9 @@ export async function claimNotionTaskRun(input: { taskId: string; eventId: strin
     sourceEventId: input.eventId,
     status: "pending",
     approvalStatus: input.requiresApproval ? "pending" : "not_required",
+    approvalExpiresAt: input.requiresApproval ? approvalDeadline(input.taskId) : null,
     matchingEvidence: input.evidence,
-  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
+  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id, attempts: taskRuns.attempts });
   return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
 }
 
@@ -1170,7 +1302,10 @@ export async function claimIntegrationSourceEvent() {
   const rows = await db.execute<{ id: string; connectionId: string; provider: IntegrationProvider; eventName: string; summary: string; occurredAt: string | null }>(sql`
     WITH next AS (
       SELECT id FROM source_events
-      WHERE kind = 'integration.event' AND processing_state = 'pending' AND available_at <= NOW()
+      WHERE kind = 'integration.event' AND (
+        (processing_state = 'pending' AND available_at <= NOW())
+        OR (processing_state = 'processing' AND updated_at < NOW() - INTERVAL '10 minutes')
+      )
       ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
     )
     UPDATE source_events e SET processing_state = 'processing', attempts = attempts + 1, updated_at = NOW()
@@ -1184,7 +1319,7 @@ export async function claimIntegrationSourceEvent() {
 export async function listActiveIntegrationTasks(connectionId: string) {
   const rows = await db.select({
     id: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt,
-    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt,
+    trigger: tasks.trigger, action: tasks.action, activationAt: tasks.activationAt, delivery: tasks.delivery,
   }).from(tasks).where(and(eq(tasks.integrationConnectionId, connectionId), eq(tasks.status, "active")));
   return rows.map((row) => ({ ...row, trigger: row.trigger as IntegrationTaskTrigger, action: row.action as TaskAction }));
 }
@@ -1192,8 +1327,8 @@ export async function listActiveIntegrationTasks(connectionId: string) {
 export async function claimIntegrationTaskRun(input: { taskId: string; eventId: string; requiresApproval: boolean; evidence: unknown }) {
   const [run] = await db.insert(taskRuns).values({
     id: randomId(), taskId: input.taskId, sourceEventId: input.eventId, status: "pending",
-    approvalStatus: input.requiresApproval ? "pending" : "not_required", matchingEvidence: input.evidence,
-  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id });
+    approvalStatus: input.requiresApproval ? "pending" : "not_required", approvalExpiresAt: input.requiresApproval ? approvalDeadline(input.taskId) : null, matchingEvidence: input.evidence,
+  }).onConflictDoNothing({ target: [taskRuns.taskId, taskRuns.sourceEventId] }).returning({ id: taskRuns.id, attempts: taskRuns.attempts });
   return run ? { ...run, awaitingApproval: input.requiresApproval } : null;
 }
 
@@ -1221,7 +1356,7 @@ export async function enqueueGmailNotification(input: { id: string; userId: stri
     kind: "gmail.notification",
     pubsubMessageId: input.pubsubMessageId,
     historyId: input.historyId,
-    dedupKey: `pubsub:${input.pubsubMessageId}`,
+    dedupKey: `pubsub:${input.gmailConnectionId}:${input.pubsubMessageId}`,
   }).onConflictDoNothing({ target: sourceEvents.dedupKey }).returning({ id: sourceEvents.id });
   return result.length > 0;
 }
@@ -1229,7 +1364,10 @@ export async function enqueueGmailNotification(input: { id: string; userId: stri
 export async function claimSourceEvent() {
   const rows = await db.execute<{ id: string; connectionId: string; attempts: number }>(sql`
     WITH next AS (
-      SELECT id FROM source_events WHERE kind = 'gmail.notification' AND processing_state = 'pending' AND available_at <= NOW()
+      SELECT id FROM source_events WHERE kind = 'gmail.notification' AND (
+        (processing_state = 'pending' AND available_at <= NOW())
+        OR (processing_state = 'processing' AND updated_at < NOW() - INTERVAL '10 minutes')
+      )
       ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
     )
     UPDATE source_events e SET processing_state = 'processing', attempts = attempts + 1, updated_at = NOW()
@@ -1310,6 +1448,7 @@ export async function claimTaskRun(input: {
     sourceEventId,
     status: "pending",
     approvalStatus: input.requiresApproval ? "pending" : "not_required",
+    approvalExpiresAt: input.requiresApproval ? approvalDeadline(input.taskId) : null,
     matchingEvidence,
   }).onConflictDoUpdate({
     target: [taskRuns.taskId, taskRuns.sourceEventId],
@@ -1356,12 +1495,24 @@ export async function advanceSourceEvent(eventId: string, error?: string, retryA
 }
 
 export async function listTaskRuns(userId: string) {
+  await db.update(taskRuns).set({ approvalStatus: "expired", updatedAt: sql`now()` }).from(tasks)
+    .where(and(eq(taskRuns.taskId, tasks.id), eq(tasks.userId, userId), eq(taskRuns.approvalStatus, "pending"), lte(taskRuns.approvalExpiresAt, sql`now()`)));
   return db.select({
     id: taskRuns.id,
     taskId: taskRuns.taskId,
     taskPrompt: tasks.originalPrompt,
     status: taskRuns.status,
     approvalStatus: taskRuns.approvalStatus,
+    approvalExpiresAt: taskRuns.approvalExpiresAt,
+    approvalDecidedAt: taskRuns.approvalDecidedAt,
+    approvalDecidedBy: taskRuns.approvalDecidedBy,
+    approvalViewedAt: taskRuns.approvalViewedAt,
+    sourceKind: sourceEvents.kind,
+    sourceEventId: sourceEvents.id,
+    sourceEventHeaders: sourceEvents.headers,
+    sourceOccurredAt: sourceEvents.occurredAt,
+    taskAction: tasks.action,
+    executionMode: tasks.executionMode,
     sender: sql<string | null>`coalesce(${sourceEvents.headers}->>'from', case when ${sourceEvents.kind} = 'vercel.deployment.failed' then 'Vercel' when ${sourceEvents.kind} = 'notion.page.updated' then 'Notion' when ${sourceEvents.kind} = 'public.signal' then 'Public data' end)`,
     subject: sql<string | null>`coalesce(${sourceEvents.headers}->>'subject', (${sourceEvents.headers}->>'projectName') || ' deployment failed', (${sourceEvents.headers}->>'pageTitle') || ' updated', ${sourceEvents.headers}->>'signal')`,
     snippet: sql<string | null>`coalesce(${sourceEvents.snippet}, ${sourceEvents.headers}->>'gitCommitMessage')`,
@@ -1389,29 +1540,48 @@ export async function listTaskRuns(userId: string) {
 }
 
 export async function decideTaskRunApproval(userId: string, runId: string, decision: "approved" | "rejected") {
-  const [run] = await db.update(taskRuns).set({ approvalStatus: decision, updatedAt: sql`now()` })
+  const [run] = await db.update(taskRuns).set({ approvalStatus: decision, approvalDecidedAt: sql`now()`, approvalDecidedBy: userId, approvalViewedAt: sql`coalesce(${taskRuns.approvalViewedAt}, now())`, updatedAt: sql`now()` })
     .from(tasks)
-    .where(and(eq(taskRuns.id, runId), eq(taskRuns.taskId, tasks.id), eq(tasks.userId, userId), eq(taskRuns.status, "pending"), eq(taskRuns.approvalStatus, "pending")))
-    .returning({ id: taskRuns.id, approvalStatus: taskRuns.approvalStatus });
+    .where(and(eq(taskRuns.id, runId), eq(taskRuns.taskId, tasks.id), eq(tasks.userId, userId), eq(taskRuns.status, "pending"), eq(taskRuns.approvalStatus, "pending"), gt(taskRuns.approvalExpiresAt, sql`now()`)))
+    .returning({ id: taskRuns.id, approvalStatus: taskRuns.approvalStatus, approvalDecidedAt: taskRuns.approvalDecidedAt, approvalDecidedBy: taskRuns.approvalDecidedBy });
   return run ?? null;
 }
 
-export async function claimApprovedTaskRun() {
+export async function unreadApprovalCount(userId: string) {
+  const rows = await db.execute<{ count: number }>(sql`select count(*)::int as count from task_runs r join tasks t on t.id = r.task_id where t.user_id = ${userId} and r.approval_status = 'pending' and r.approval_viewed_at is null and r.approval_expires_at > now()`);
+  return rows[0]?.count ?? 0;
+}
+
+export async function markApprovalsRead(userId: string) {
+  await db.update(taskRuns).set({ approvalViewedAt: sql`now()`, updatedAt: sql`now()` }).from(tasks)
+    .where(and(eq(taskRuns.taskId, tasks.id), eq(tasks.userId, userId), eq(taskRuns.approvalStatus, "pending"), isNull(taskRuns.approvalViewedAt)));
+}
+
+export async function claimDispatchableTaskRun() {
   const rows = await db.execute<{ id: string }>(sql`
     WITH next AS (
-      SELECT id FROM task_runs
-      WHERE approval_status = 'approved' AND (
-        status = 'pending' OR (status = 'calling' AND call_task_id IS NULL AND updated_at < NOW() - INTERVAL '10 minutes')
+      SELECT r.id FROM task_runs r
+      INNER JOIN tasks t ON t.id = r.task_id
+      INNER JOIN source_events e ON e.id = r.source_event_id
+      WHERE t.status = 'active' AND (
+        (r.approval_status = 'approved' AND (
+          r.status = 'pending' OR (r.status = 'calling' AND r.call_task_id IS NULL AND r.updated_at < NOW() - INTERVAL '10 minutes')
+        )) OR (
+          r.approval_status IN ('approved', 'not_required')
+          AND r.status = 'failed' AND r.available_at <= NOW() AND r.attempts < 8
+          AND (e.kind <> 'gmail.message' OR r.approval_status = 'approved')
+        )
       )
-      ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1
+      ORDER BY r.created_at FOR UPDATE OF r SKIP LOCKED LIMIT 1
     )
-    UPDATE task_runs r SET status = 'calling', updated_at = NOW()
+    UPDATE task_runs r SET status = 'calling', attempts = CASE WHEN r.status = 'failed' THEN r.attempts + 1 ELSE r.attempts END,
+      available_at = NULL, error = NULL, provider_error = NULL, updated_at = NOW()
     FROM next WHERE r.id = next.id RETURNING r.id
   `);
   const [claimed] = rows;
   if (!claimed) return null;
   const [run] = await db.select({
-    id: taskRuns.id, taskId: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt, trigger: tasks.trigger, action: tasks.action,
+    id: taskRuns.id, attempts: taskRuns.attempts, taskId: tasks.id, userId: tasks.userId, originalPrompt: tasks.originalPrompt, trigger: tasks.trigger, action: tasks.action, delivery: tasks.delivery,
     sourceKind: sourceEvents.kind, eventHeaders: sourceEvents.headers, eventSnippet: sourceEvents.snippet,
     gmailMessageId: sourceEvents.gmailMessageId, connectionId: gmailConnections.id, gmailAddress: gmailConnections.gmailAddress,
     encryptedRefreshToken: gmailConnections.encryptedRefreshToken, grantedScopes: gmailConnections.grantedScopes, labelMap: gmailConnections.gmailLabels,
@@ -1427,25 +1597,18 @@ export async function saveCallTask(call: { id: string; userId: string; task: str
 
 export async function reserveCallDispatch(userId: string, eventId: string, dailyLimit: number) {
   const eventKey = `${userId}:${eventId}`;
-  const rows = await db.execute<{ eventKey: string }>(sql`
-    WITH locked AS MATERIALIZED (
-      SELECT pg_advisory_xact_lock(hashtextextended(${userId}, 0))
-    ), existing AS (
-      SELECT event_key FROM call_dispatch_reservations WHERE event_key = ${eventKey}
-    ), inserted AS (
-      INSERT INTO call_dispatch_reservations (event_key, user_id)
-      SELECT ${eventKey}, ${userId} FROM locked
-      WHERE NOT EXISTS (SELECT 1 FROM existing)
-        AND (SELECT COUNT(*) FROM call_dispatch_reservations WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours') < ${dailyLimit}
-      ON CONFLICT DO NOTHING
-      RETURNING event_key
-    )
-    SELECT event_key AS "eventKey" FROM existing
-    UNION ALL
-    SELECT event_key AS "eventKey" FROM inserted
-    LIMIT 1
-  `);
-  return rows.length > 0;
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${userId}, 0))`);
+    const existing = await tx.execute(sql`SELECT 1 FROM call_dispatch_reservations WHERE event_key = ${eventKey}`);
+    if (existing.length) return true;
+    const capacity = await tx.execute<{ allowed: boolean }>(sql`
+      SELECT (COUNT(*) < ${dailyLimit}) AS allowed FROM call_dispatch_reservations
+      WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours'
+    `);
+    if (!capacity[0]?.allowed) return false;
+    await tx.execute(sql`INSERT INTO call_dispatch_reservations (event_key, user_id) VALUES (${eventKey}, ${userId})`);
+    return true;
+  });
 }
 
 export async function hasCallDispatchCapacity(userId: string, dailyLimit: number) {
@@ -1455,6 +1618,14 @@ export async function hasCallDispatchCapacity(userId: string, dailyLimit: number
     WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours'
   `);
   return rows[0]?.allowed ?? false;
+}
+
+export async function callDispatchUsage(userId: string) {
+  const rows = await db.execute<{ used: number }>(sql`
+    SELECT COUNT(*)::int AS used FROM call_dispatch_reservations
+    WHERE user_id = ${userId} AND created_at >= NOW() - INTERVAL '24 hours'
+  `);
+  return rows[0]?.used ?? 0;
 }
 
 export async function updateCallTask(call: {
@@ -1469,6 +1640,7 @@ export async function updateCallTask(call: {
   answeredBy?: CalleAnsweredBy | null;
   failureCode?: string | null;
   failureMessage?: string | null;
+  providerError?: CalleProviderError | null;
   providerEventId?: string | null;
   completedAt?: string | null;
   queueEmailReply?: boolean;
@@ -1476,7 +1648,7 @@ export async function updateCallTask(call: {
   const recipient = call.recipients?.[0];
   const terminalFailure = call.status === "failed" || call.status === "canceled";
   await db.transaction(async (tx) => {
-    await tx.update(callTasks).set({
+    const [updated] = await tx.update(callTasks).set({
       status: call.status,
       summary: call.summary ?? null,
       result: call.result ?? null,
@@ -1491,19 +1663,31 @@ export async function updateCallTask(call: {
       failureMessage: call.failureMessage ?? null,
       providerEventId: call.providerEventId ?? null,
       completedAt: call.completedAt ?? null,
-      updatedAt: sql`now()`,
-    }).where(eq(callTasks.id, call.id));
-    await tx.update(taskRuns).set({
-      status: call.status === "completed" ? "completed" : terminalFailure ? "failed" : "calling",
-      result: call.result ?? null,
-      error: terminalFailure ? call.failureMessage ?? call.failureCode ?? "CALL-E call failed" : null,
-      providerError: terminalFailure ? {
+      providerError: call.providerError ?? (terminalFailure ? {
         status: null,
         code: call.failureCode ?? "call_failed",
         message: call.failureMessage ?? "CALL-E call failed",
         details: {},
         retryAfterSeconds: null,
-      } : null,
+      } : null),
+      reconcileAvailableAt: call.status === "completed" || terminalFailure ? null : sql`now() + interval '10 minutes'`,
+      updatedAt: sql`now()`,
+    }).where(and(
+      eq(callTasks.id, call.id),
+      or(sql`${callTasks.status} not in ('completed', 'failed', 'canceled')`, eq(callTasks.status, call.status)),
+    )).returning({ id: callTasks.id });
+    if (!updated) return;
+    await tx.update(taskRuns).set({
+      status: call.status === "completed" ? "completed" : terminalFailure ? "failed" : "calling",
+      result: call.result ?? null,
+      error: terminalFailure ? call.failureMessage ?? call.failureCode ?? "CALL-E call failed" : null,
+      providerError: call.providerError ?? (terminalFailure ? {
+        status: null,
+        code: call.failureCode ?? "call_failed",
+        message: call.failureMessage ?? "CALL-E call failed",
+        details: {},
+        retryAfterSeconds: null,
+      } : null),
       updatedAt: sql`now()`,
     }).where(eq(taskRuns.callTaskId, call.id));
     if (call.queueEmailReply) {
@@ -1521,8 +1705,18 @@ export async function updateCallTask(call: {
 }
 
 export async function getStoredCallTask(id: string) {
-  const [call] = await db.select({ id: callTasks.id, status: callTasks.status }).from(callTasks).where(eq(callTasks.id, id)).limit(1);
+  const [call] = await db.select({
+    id: callTasks.id, userId: callTasks.userId, phone: callTasks.phone, source: callTasks.source, status: callTasks.status,
+  }).from(callTasks).where(eq(callTasks.id, id)).limit(1);
   return call ?? null;
+}
+
+export async function getLatestVerificationCall(userId: string) {
+  const [call] = await db.select({
+    id: callTasks.id, status: callTasks.status, failureMessage: callTasks.failureMessage, createdAt: callTasks.createdAt,
+  }).from(callTasks).where(and(eq(callTasks.userId, userId), eq(callTasks.source, "verification")))
+    .orderBy(desc(callTasks.createdAt)).limit(1);
+  return call ? { ...call } : null;
 }
 
 export type PendingEmailReply = {
@@ -1538,6 +1732,11 @@ export type PendingEmailReply = {
 };
 
 export async function claimPendingEmailReply(): Promise<PendingEmailReply | null> {
+  await db.update(callTasks).set({
+    replyStatus: "failed",
+    replyError: "Reply delivery could not be confirmed after a worker interruption; it was not retried to avoid a duplicate email.",
+    updatedAt: sql`now()`,
+  }).where(and(eq(callTasks.replyStatus, "sending"), lt(callTasks.updatedAt, sql`now() - interval '30 minutes'`)));
   const rows = await db.execute<{ id: string }>(sql`
     WITH next AS (
       SELECT id FROM call_tasks
@@ -1611,8 +1810,7 @@ export async function markEmailReplyFailed(callId: string, error: string) {
     .where(and(eq(callTasks.id, callId), eq(callTasks.replyStatus, "sending")));
 }
 
-export async function listCallTasks(userId: string) {
-  return db.select({
+const callSelection = {
     id: callTasks.id,
     task: callTasks.task,
     phone: callTasks.phone,
@@ -1630,8 +1828,108 @@ export async function listCallTasks(userId: string) {
     failureCode: callTasks.failureCode,
     failureMessage: callTasks.failureMessage,
     providerEventId: callTasks.providerEventId,
+    taskRunId: callTasks.taskRunId,
+    taskId: taskRuns.taskId,
+    sourceEventId: taskRuns.sourceEventId,
+    taskName: tasks.name,
+    taskRunAttempts: taskRuns.attempts,
+    providerError: callTasks.providerError,
+    retryAt: taskRuns.availableAt,
+    replyStatus: callTasks.replyStatus,
+    replyMessageId: callTasks.replyMessageId,
+    replyError: callTasks.replyError,
+    reconciliationAttempts: callTasks.reconciliationAttempts,
+    reconcileAvailableAt: callTasks.reconcileAvailableAt,
     completedAt: callTasks.completedAt,
     createdAt: callTasks.createdAt,
     updatedAt: callTasks.updatedAt,
-  }).from(callTasks).where(eq(callTasks.userId, userId)).orderBy(desc(callTasks.createdAt));
+};
+
+export type CallListOptions = {
+  source?: string;
+  triggerId?: string;
+  recipient?: string;
+  status?: string;
+  answeredBy?: string;
+  from?: string;
+  to?: string;
+  cursor?: string;
+  limit?: number;
+};
+
+export async function listCallTasks(userId: string, options: CallListOptions = {}) {
+  const filters = [eq(callTasks.userId, userId)];
+  if (options.source) filters.push(eq(callTasks.source, options.source));
+  if (options.triggerId) filters.push(eq(taskRuns.taskId, options.triggerId));
+  if (options.recipient) filters.push(or(ilike(callTasks.phone, `%${options.recipient}%`), sql`${callTasks.recipients}::text ilike ${`%${options.recipient}%`}`)!);
+  if (options.status === "unanswered") filters.push(and(eq(callTasks.status, "completed"), or(isNull(callTasks.answeredBy), eq(callTasks.answeredBy, "voicemail"), eq(callTasks.answeredBy, "unknown")))!);
+  else if (options.status) filters.push(eq(callTasks.status, options.status));
+  if (options.answeredBy) filters.push(eq(callTasks.answeredBy, options.answeredBy));
+  if (options.from) filters.push(sql`${callTasks.createdAt} >= ${options.from}::timestamptz`);
+  if (options.to) filters.push(sql`${callTasks.createdAt} <= ${options.to}::timestamptz`);
+  if (options.cursor) {
+    try {
+      const cursor = JSON.parse(Buffer.from(options.cursor, "base64url").toString()) as { createdAt: string; id: string };
+      if (!cursor.createdAt || !cursor.id) throw new Error("invalid cursor");
+      filters.push(or(lt(callTasks.createdAt, cursor.createdAt), and(eq(callTasks.createdAt, cursor.createdAt), lt(callTasks.id, cursor.id)))!);
+    } catch {
+      filters.push(lt(callTasks.createdAt, options.cursor));
+    }
+  }
+  const limit = Math.min(Math.max(options.limit ?? 25, 1), 10_000);
+  const rows = await db.select(callSelection).from(callTasks)
+    .leftJoin(taskRuns, eq(taskRuns.id, callTasks.taskRunId))
+    .leftJoin(tasks, eq(tasks.id, taskRuns.taskId))
+    .where(and(...filters)).orderBy(desc(callTasks.createdAt), desc(callTasks.id)).limit(limit + 1);
+  const last = rows[limit - 1];
+  return { calls: rows.slice(0, limit), nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ createdAt: last.createdAt, id: last.id })).toString("base64url") : null };
+}
+
+export async function getCallTask(userId: string, id: string) {
+  const [call] = await db.select(callSelection).from(callTasks)
+    .leftJoin(taskRuns, eq(taskRuns.id, callTasks.taskRunId))
+    .leftJoin(tasks, eq(tasks.id, taskRuns.taskId))
+    .where(and(eq(callTasks.userId, userId), eq(callTasks.id, id))).limit(1);
+  return call ?? null;
+}
+
+export async function callMetrics(userId: string) {
+  const rows = await db.execute<{ fired: number; completed: number; unanswered: number; failed: number; replies: number }>(sql`
+    select count(*)::int as fired,
+      count(*) filter (where status = 'completed')::int as completed,
+      count(*) filter (where answered_by in ('voicemail', 'unknown') or answered_by is null and status = 'completed')::int as unanswered,
+      count(*) filter (where status in ('failed', 'canceled'))::int as failed,
+      count(*) filter (where reply_status = 'sent')::int as replies
+    from call_tasks where user_id = ${userId} and created_at >= now() - interval '24 hours'
+  `);
+  return rows[0] ?? { fired: 0, completed: 0, unanswered: 0, failed: 0, replies: 0 };
+}
+
+export async function retryEmailReply(userId: string, callId: string) {
+  const [call] = await db.update(callTasks).set({ replyStatus: "pending", replyError: null, updatedAt: sql`now()` })
+    .where(and(eq(callTasks.id, callId), eq(callTasks.userId, userId), eq(callTasks.replyStatus, "failed"), isNull(callTasks.replyMessageId), isNotNull(callTasks.taskRunId))).returning({ id: callTasks.id, replyStatus: callTasks.replyStatus });
+  return call ?? null;
+}
+
+export async function claimStaleCallForReconciliation() {
+  const rows = await db.execute<{ id: string; attempts: number; userId: string; phone: string; source: string }>(sql`
+    with next as (
+      select c.id from call_tasks c join task_runs r on r.id = c.task_run_id
+      where r.status = 'calling' and c.status not in ('completed', 'failed', 'canceled')
+        and c.updated_at < now() - interval '10 minutes' and c.reconcile_available_at <= now()
+      order by c.reconcile_available_at, c.created_at for update of c skip locked limit 1
+    )
+    update call_tasks c set reconciliation_attempts = c.reconciliation_attempts + 1,
+      reconcile_available_at = null, updated_at = now()
+    from next where c.id = next.id returning c.id, c.reconciliation_attempts as attempts, c.user_id as "userId", c.phone, c.source
+  `);
+  return rows[0] ?? null;
+}
+
+export async function rescheduleCallReconciliation(id: string, error: string | null, retryAt: Date, providerError?: CalleProviderError | null) {
+  await db.update(callTasks).set({
+    providerError: error ? providerError ?? { status: null, code: "reconciliation_failed", message: error, details: {}, retryAfterSeconds: null } : null,
+    reconcileAvailableAt: retryAt.toISOString(),
+    updatedAt: sql`now()`,
+  }).where(eq(callTasks.id, id));
 }

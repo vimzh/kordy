@@ -2,7 +2,8 @@ import { afterAll, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { eq } from "drizzle-orm";
 import server from "./index";
-import { db, saveCallTask, upsertUser } from "./db";
+import { validReturnTo } from "./auth";
+import { createTask, db, saveCallTask, upsertUser } from "./db";
 import { callTasks, users } from "./schema";
 
 const userId = "api-contract-test";
@@ -24,11 +25,18 @@ test("rejects a Gmail OAuth callback with mismatched state", async () => {
   expect(await response.text()).toBe("Invalid OAuth state");
 });
 
+test("accepts only short path-only OAuth return targets", () => {
+  expect(validReturnTo("/home?resume=task-1")).toBe("/home?resume=task-1");
+  expect(validReturnTo("https://evil.example/path")).toBeNull();
+  expect(validReturnTo("//evil.example/path")).toBeNull();
+  expect(validReturnTo("/\\evil.example/path")).toBeNull();
+});
+
 test("requires Gmail before parsing a task and keeps the public response shape", async () => {
   const response = await server.fetch(new Request("http://localhost/tasks", {
     method: "POST",
     headers: { Cookie: authCookie(), "Content-Type": "application/json" },
-    body: JSON.stringify({ requestId: "request-1", prompt: "Call me when alice@example.com emails about invoices", selectedSources: ["Gmail"] }),
+    body: JSON.stringify({ requestId: "request-1", prompt: "Call me when alice@example.com emails about invoices", selectedSources: ["Gmail"], executionMode: "approval" }),
   }));
   expect(response.status).toBe(409);
   expect(await response.json()).toEqual({ status: "connection_required", connection: "gmail" });
@@ -38,7 +46,7 @@ test("queues a public weather task without a connection", async () => {
   const response = await server.fetch(new Request("http://localhost/tasks", {
     method: "POST",
     headers: { Cookie: authCookie(), "Content-Type": "application/json" },
-    body: JSON.stringify({ requestId: "public-weather-1", prompt: "Call me when rain is forecast in Bengaluru", selectedSources: ["Weather"] }),
+    body: JSON.stringify({ requestId: "public-weather-1", prompt: "Call me when rain is forecast in Bengaluru", selectedSources: ["Weather"], executionMode: "approval" }),
   }));
   expect(response.status).toBe(202);
   expect(await response.json()).toMatchObject({ status: "creating", task: { originalPrompt: "Call me when rain is forecast in Bengaluru", status: "creating" } });
@@ -48,7 +56,7 @@ test("queues an Indian stock task without a brokerage connection", async () => {
   const response = await server.fetch(new Request("http://localhost/tasks", {
     method: "POST",
     headers: { Cookie: authCookie(), "Content-Type": "application/json" },
-    body: JSON.stringify({ requestId: "india-stock-1", prompt: "Call me when RELIANCE on NSE closes above ₹1,500", selectedSources: ["Indian stocks (EOD)"] }),
+    body: JSON.stringify({ requestId: "india-stock-1", prompt: "Call me when RELIANCE on NSE closes above ₹1,500", selectedSources: ["Indian stocks (EOD)"], executionMode: "approval" }),
   }));
   expect(response.status).toBe(202);
   expect(await response.json()).toMatchObject({ status: "creating", task: { originalPrompt: "Call me when RELIANCE on NSE closes above ₹1,500", status: "creating" } });
@@ -72,10 +80,10 @@ test("validates and persists CALL-E calling preferences", async () => {
   const response = await server.fetch(new Request("http://localhost/profile", {
     method: "PATCH",
     headers: { Cookie: authCookie(), "Content-Type": "application/json" },
-    body: JSON.stringify({ defaultPhone: "+919876543210", callRegion: "in", callLocale: "hi-in" }),
+    body: JSON.stringify({ defaultPhone: "+919876543210", callRegion: "in", callLocale: "hi-in", approvalExpiryMinutes: 90 }),
   }));
   expect(response.status).toBe(200);
-  expect(await response.json()).toMatchObject({ profile: { defaultPhone: "+919876543210", callRegion: "IN", callLocale: "hi-IN" } });
+  expect(await response.json()).toMatchObject({ profile: { defaultPhone: "+919876543210", callRegion: "IN", callLocale: "hi-IN", approvalExpiryMinutes: 90 } });
 
   const invalid = await server.fetch(new Request("http://localhost/profile", {
     method: "PATCH",
@@ -83,6 +91,28 @@ test("validates and persists CALL-E calling preferences", async () => {
     body: JSON.stringify({ callRegion: "ZZ" }),
   }));
   expect(invalid.status).toBe(400);
+});
+
+test("previews, edits, filters, duplicates, and permanently deletes a draft task", async () => {
+  await upsertUser({ sub: userId, email: "api@example.com", name: "API Test" });
+  await createTask({
+    id: "api-managed-task", userId, requestId: "api-managed-request", name: "Managed alert", prompt: "Call me when USD/INR rises above 90", status: "draft", parserModel: "test",
+    trigger: { type: "fx.rate.threshold", base: "USD", quote: "INR", operator: "above", threshold: 90 },
+    action: { type: "calle.call", targetType: "self", targetName: "API Test", phone: "+919876543210", task: "Explain the currency alert", executionMode: "approval" },
+    executionMode: "approval",
+  });
+  const request = (path: string, init: RequestInit = {}) => server.fetch(new Request(`http://localhost${path}`, { ...init, headers: { Cookie: authCookie(), "Content-Type": "application/json", ...init.headers } }));
+  const edited = await request("/tasks/api-managed-task", { method: "PATCH", body: JSON.stringify({ name: "Managed FX alert", delivery: { timezone: "Asia/Kolkata", quietHoursStart: "22:00", quietHoursEnd: "07:00", maxCallsPerHour: 0, region: "in", locale: "hi-in" } }) });
+  expect(edited.status).toBe(200);
+  expect(await edited.json()).toMatchObject({ task: { name: "Managed FX alert", status: "draft", executionMode: "approval", delivery: { timezone: "Asia/Kolkata", maxCallsPerHour: 0, region: "IN", locale: "hi-IN" } } });
+  const preview = await request("/tasks/api-managed-task/test", { method: "POST" });
+  expect(await preview.json()).toMatchObject({ test: true, dispatched: false, preview: { source: "fx.rate.threshold", executionMode: "approval", callObjective: "Explain the currency alert" } });
+  const listed = await request("/tasks?status=draft&search=Managed%20FX");
+  expect((await listed.json()).tasks).toHaveLength(1);
+  const duplicated = await request("/tasks/api-managed-task/duplicate", { method: "POST" });
+  expect(await duplicated.json()).toMatchObject({ task: { name: "Managed FX alert copy", status: "draft" } });
+  expect((await request("/tasks/api-managed-task", { method: "DELETE" })).status).toBe(400);
+  expect((await request("/tasks/api-managed-task?confirm=true", { method: "DELETE" })).status).toBe(204);
 });
 
 test("persists terminal CALL-E evidence without placing a call", async () => {

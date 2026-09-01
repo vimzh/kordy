@@ -1,11 +1,11 @@
-import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { getSession } from "@/lib/auth";
 
 export default async function LoginPage({
 }: PageProps<"/login">) {
-  if ((await cookies()).has("kyub_session")) {
+  if (await getSession()) {
     redirect("/home");
   }
 

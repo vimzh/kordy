@@ -97,6 +97,16 @@ describe('task plan validation', () => {
     expect(taskTriggerFromResult(githubPlan, githubContext)).toEqual({ type: 'integration.event', provider: 'github', ...githubPlan.trigger.rules })
   })
 
+  test('rejects Calendar windows shorter than the polling interval', () => {
+    const calendarPlan = {
+      status: 'complete' as const,
+      trigger: { source: 'google_calendar' as const, event: 'integration.event' as const, rules: { eventNames: ['event.starting'], keywords: [], withinMinutes: 1 } },
+      action: { type: 'calle.call' as const, target: { type: 'self' as const }, task: 'Explain the upcoming Calendar event.' },
+    }
+    const calendarContext = { ...context, integration: { connected: true, provider: 'google_calendar' as const, label: 'owner@example.com' } }
+    expect(() => validateTaskResult(calendarPlan, calendarContext)).toThrow('at least 5 minutes')
+  })
+
   test('accepts public sources without a connected account', () => {
     const weatherPlan = {
       status: 'complete' as const,

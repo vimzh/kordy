@@ -2,7 +2,7 @@
 
 import Image from "next/image";
 import Link from "next/link";
-import { House, LogOut, Plug, Settings, Users, Zap } from "lucide-react";
+import { House, LogOut, PhoneCall, Plug, Settings, Users, Zap } from "lucide-react";
 import { useState } from "react";
 import {
   DropdownMenu,
@@ -26,6 +26,7 @@ import {
 const navItems = [
   { label: "Home", href: "/home", icon: House },
   { label: "Triggers", href: "/triggers", icon: Zap },
+  { label: "Calls", href: "/calls", icon: PhoneCall },
   { label: "Connections", href: "/connections", icon: Plug },
   { label: "Contacts", href: "/contacts", icon: Users },
   { label: "Settings", href: "/settings", icon: Settings },

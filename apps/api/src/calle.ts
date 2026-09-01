@@ -1,7 +1,7 @@
 // Server-only CALL-E client and source-specific call contract builder.
 export const calleSources = [
   "gmail", "vercel", "notion", "github", "stripe", "google_calendar", "n8n",
-  "weather", "sec", "usgs", "nasa", "fx", "india", "generic",
+  "weather", "sec", "usgs", "nasa", "fx", "india", "verification", "generic",
 ] as const;
 
 export type CalleSource = typeof calleSources[number];
@@ -188,6 +188,13 @@ const sourceContracts: Record<CalleSource, SourceContract> = {
     outcomeValues: ["acknowledged", "remind_later", "review", "unclear", "unknown"],
     outcomeDescription: "The recipient's explicit response to the Indian-market alert.",
   },
+  verification: {
+    objective: "Explain that this one-time call verifies ownership of the saved phone number. Ask the recipient to explicitly confirm whether they own and control this number. Do not accept silence, voicemail, an IVR, or an ambiguous answer as confirmation.",
+    actionValues: ["confirm_ownership", "deny_ownership", "unknown"],
+    outcomeField: "ownership_confirmed",
+    outcomeValues: ["yes", "no", "unknown"],
+    outcomeDescription: "Use yes only when the human recipient explicitly confirms that they own and control this phone number.",
+  },
   generic: {
     objective: "Explain the supplied alert in one or two sentences and ask one relevant question. Do not invent missing context.",
     actionValues: ["none", "acknowledge", "other", "unknown"],
@@ -263,6 +270,18 @@ export function confirmedReplyInstruction(result: unknown, confidence: CalleComp
     && typeof value.reply_instruction === "string" && value.reply_instruction.trim()
     ? value.reply_instruction.trim()
     : null;
+}
+
+export function confirmedPhoneOwnership(call: CalleCall) {
+  const result = call.structured_result;
+  return call.status === "completed"
+    && call.task_completed === true
+    && answeredBy(call) === "human"
+    && call.completion_confidence?.label === "high"
+    && call.completion_confidence.score >= 0.8
+    && result?.ownership_confirmed === "yes"
+    && typeof result.evidence === "string"
+    && Boolean(result.evidence.trim());
 }
 
 function resultSchema(source: CalleSource) {

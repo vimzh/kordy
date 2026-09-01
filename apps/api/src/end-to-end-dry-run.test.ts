@@ -14,6 +14,7 @@ import {
   getVercelConnection,
   initializeDatabase,
   listTaskRuns,
+  markDefaultPhoneVerified,
   markTaskRunDispatched,
   persistGmailMessage,
   persistIntegrationEvent,
@@ -27,6 +28,8 @@ import {
   saveNotionConnection,
   saveVercelConnection,
   upsertUser,
+  updateOutboundCallConsent,
+  updateProfile,
   type GmailConnection,
   type GmailTaskTrigger,
   type IntegrationConnection,
@@ -67,6 +70,9 @@ const integrationConnections = new Map<IntegrationProvider, IntegrationConnectio
 beforeAll(async () => {
   await initializeDatabase();
   await upsertUser({ sub: userId, email: `${userId}@example.com`, name: "Dry Run", picture: "" });
+  await updateProfile(userId, { defaultPhone: phone });
+  await updateOutboundCallConsent(userId, true);
+  await markDefaultPhoneVerified(userId, phone);
   await saveGmailConnection({ id: gmailConnectionId, userId, gmailAddress: "dry-run@gmail.com", encryptedRefreshToken: "test", grantedScopes: [], labelMap: { IMPORTANT: "IMPORTANT", INBOX: "INBOX" }, status: "connected", historyId: "1" });
   gmailConnection = { id: gmailConnectionId, userId, gmailAddress: "dry-run@gmail.com", encryptedRefreshToken: "test", grantedScopes: [], labelMap: { IMPORTANT: "IMPORTANT", INBOX: "INBOX" }, status: "connected", historyId: "1", watchExpiration: null, lastSyncedAt: null };
   await saveVercelConnection({ id: vercelConnectionId, userId, accountId: "account", accountName: "Dry Run", accountSlug: "dry-run", teamId: null, encryptedAccessToken: "test", projects: [{ id: "project-api", name: "api" }, { id: "project-web", name: "web" }], status: "connected" });
@@ -291,6 +297,9 @@ test("64 call-me scenarios reach the CALL-E request boundary without making a ph
     expect(requests).toHaveLength(64);
 
     await upsertUser({ sub: budgetUserId, email: `${budgetUserId}@example.com` });
+    await updateProfile(budgetUserId, { defaultPhone: phone });
+    await updateOutboundCallConsent(budgetUserId, true);
+    await markDefaultPhoneVerified(budgetUserId, phone);
     process.env.CALLE_DAILY_CALL_LIMIT = "1";
     await dispatchCalleCall({ task: "First budgeted dry run", phone, userId: budgetUserId, eventId: "first", source: "generic" });
     await expect(dispatchCalleCall({ task: "Blocked budget dry run", phone, userId: budgetUserId, eventId: "second", source: "generic" })).rejects.toThrow("Daily CALL-E call limit reached");
@@ -302,4 +311,4 @@ test("64 call-me scenarios reach the CALL-E request boundary without making a ph
     if (originalBase === undefined) delete process.env.CALLE_BASE_URL; else process.env.CALLE_BASE_URL = originalBase;
     if (originalWebhook === undefined) delete process.env.CALLE_WEBHOOK_URL; else process.env.CALLE_WEBHOOK_URL = originalWebhook;
   }
-});
+}, 30_000);

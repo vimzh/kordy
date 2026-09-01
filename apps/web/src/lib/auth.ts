@@ -1,7 +1,7 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 
-export async function requireSession() {
+export async function getSession() {
   const response = await fetch(
     `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007"}/auth/me`,
     {
@@ -16,7 +16,11 @@ export async function requireSession() {
     user: { name?: string; email?: string } | null;
   };
 
-  if (!user) redirect("/login");
+  return user;
+}
 
+export async function requireSession() {
+  const user = await getSession();
+  if (!user) redirect("/login");
   return user;
 }

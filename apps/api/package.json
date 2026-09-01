@@ -1,7 +1,8 @@
 {
   "name": "@kyub/api",
   "scripts": {
-    "dev": "bun run --watch src/index.ts",
+    "dev": "bun run --parallel dev:api dev:worker",
+    "dev:api": "bun run --watch src/index.ts",
     "worker": "bun run src/worker.ts",
     "dev:worker": "bun run --watch src/worker.ts",
     "ai:logs": "bunx @ai-sdk/devtools",

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { MessageSquare, Plus, Search, Workflow } from "lucide-react";
+import { MessageSquare, Search, Workflow } from "lucide-react";
 import {
   SiAirtable,
   SiAsana,
@@ -238,10 +238,6 @@ export function ConnectionsCatalog() {
               className="h-9 pl-8"
             />
           </label>
-          <Button type="button" size="lg">
-            <Plus />
-            New custom connection
-          </Button>
         </div>
       </div>
 
@@ -273,7 +269,7 @@ export function ConnectionsCatalog() {
                   status={vercel.status}
                   detail={`${vercel.name} · ${vercel.projects.length} project${vercel.projects.length === 1 ? "" : "s"}`}
                   busy={loading || disconnectingId === vercel.id}
-                  connectHref={vercel.status === "needs_reconnect" ? `${apiUrl}/connections/vercel/start` : undefined}
+                  connectHref={vercel.status !== "connected" ? `${apiUrl}/connections/vercel/start` : undefined}
                   onDisconnect={() => void disconnectVercel(vercel.id)}
                 />
               ));
@@ -292,7 +288,7 @@ export function ConnectionsCatalog() {
                   status={notion.status}
                   detail={`${notion.name} · ${notion.pages.length} shared page${notion.pages.length === 1 ? "" : "s"}`}
                   busy={loading || disconnectingId === notion.id}
-                  connectHref={notion.status === "needs_reconnect" ? `${apiUrl}/connections/notion/start` : undefined}
+                  connectHref={notion.status !== "connected" ? `${apiUrl}/connections/notion/start` : undefined}
                   onDisconnect={() => void disconnectNotion(notion.id)}
                 />
               ));
@@ -306,7 +302,7 @@ export function ConnectionsCatalog() {
             const integrationProvider = (Object.entries(integrationNames).find(([, name]) => name === connection.name)?.[0] ?? null) as IntegrationProvider | null;
             if (integrationProvider) {
               const connected = integrationConnections.find((item) => item.provider === integrationProvider);
-              if (connected) return <ConnectionCard key={connected.id} {...connection} status={connected.status} detail={connected.label} busy={loading || disconnectingId === connected.id} connectHref={integrationProvider === "google_calendar" && connected.status === "needs_reconnect" ? `${apiUrl}/connections/google-calendar/start` : undefined} onDisconnect={() => void disconnectIntegration(connected.id)} />;
+              if (connected) return <ConnectionCard key={connected.id} {...connection} status={connected.status} detail={connected.label} busy={loading || disconnectingId === connected.id} connectHref={integrationProvider === "google_calendar" && connected.status !== "connected" ? `${apiUrl}/connections/google-calendar/start` : undefined} onConnect={integrationProvider !== "google_calendar" && connected.status !== "connected" ? () => setSetupProvider(integrationProvider) : undefined} onDisconnect={connected.status === "connected" ? () => void disconnectIntegration(connected.id) : undefined} />;
               return <ConnectionCard key={connection.name} {...connection} status="disconnected" busy={loading} connectHref={integrationProvider === "google_calendar" ? `${apiUrl}/connections/google-calendar/start` : undefined} onConnect={integrationProvider === "google_calendar" ? undefined : () => setSetupProvider(integrationProvider)} />;
             }
             if (connection.name !== "Gmail") return <ConnectionCard key={connection.name} {...connection} />;
@@ -317,7 +313,7 @@ export function ConnectionsCatalog() {
                 status={gmail.status}
                 detail={`Connected account: ${gmail.email}`}
                 busy={loading || disconnectingId === gmail.id}
-                connectHref={gmail.status === "needs_reconnect" && !loading ? `${apiUrl}/connections/gmail/start` : undefined}
+                connectHref={gmail.status !== "connected" && !loading ? `${apiUrl}/connections/gmail/start` : undefined}
                 onDisconnect={() => void disconnectGmail(gmail.id)}
               />
             ));

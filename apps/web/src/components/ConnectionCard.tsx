@@ -45,6 +45,11 @@ export function ConnectionCard({
       <CardContent className="flex flex-1 flex-col gap-3">
         <p className="text-sm text-muted-foreground">{description}</p>
         {detail ? <p className="truncate text-xs text-muted-foreground">{detail}</p> : null}
+        {status === "needs_reconnect" ? (
+          <p className="text-xs text-destructive">
+            Authorization expired. Reconnect to resume dependent triggers.
+          </p>
+        ) : null}
         <div className="mt-auto flex items-center justify-between gap-2">
           {status ? <Badge variant={status === "connected" ? "secondary" : "outline"}>{status.replaceAll("_", " ")}</Badge> : <span />}
           <div className="flex gap-1">

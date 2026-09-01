@@ -2,14 +2,19 @@
 
 import type { FormEvent } from "react";
 import { useEffect, useState } from "react";
-import { Phone } from "lucide-react";
+import { BadgeCheck, CircleAlert, Phone } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-type Profile = { defaultPhone: string | null; callRegion: string | null; callLocale: string | null };
+type Profile = {
+  defaultPhone: string | null;
+  callRegion: string | null;
+  callLocale: string | null;
+  phoneVerifiedAt?: string | null;
+};
 type RegionOption = { value: string; label: string; locales: Array<{ value: string; label: string }> };
 
 const english = (region: string) => ({ value: `en-${region}`, label: "English" });
@@ -67,6 +72,7 @@ export function AccountSettings() {
   const [defaultPhone, setDefaultPhone] = useState("");
   const [callRegion, setCallRegion] = useState(automatic);
   const [callLocale, setCallLocale] = useState(automatic);
+  const [phoneVerifiedAt, setPhoneVerifiedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
@@ -83,6 +89,7 @@ export function AccountSettings() {
           setDefaultPhone(result.profile.defaultPhone ?? "");
           setCallRegion(result.profile.callRegion ?? automatic);
           setCallLocale(result.profile.callLocale ?? automatic);
+          setPhoneVerifiedAt(result.profile.phoneVerifiedAt ?? null);
         }
       })
       .catch((error) => { if (active) setMessage(error instanceof Error ? error.message : "Could not load settings"); })
@@ -117,6 +124,7 @@ export function AccountSettings() {
       setDefaultPhone(result.profile.defaultPhone ?? "");
       setCallRegion(result.profile.callRegion ?? automatic);
       setCallLocale(result.profile.callLocale ?? automatic);
+      setPhoneVerifiedAt(result.profile.phoneVerifiedAt ?? null);
       setMessage("Saved.");
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not save call preferences");
@@ -131,7 +139,7 @@ export function AccountSettings() {
         <h1 className="text-heading">Settings</h1>
         <p className="mt-1 text-sm text-muted-foreground">Manage your Kordy account preferences.</p>
       </div>
-      <Card size="sm" className="max-w-xl gap-3">
+      <Card id="call-delivery" size="sm" className="max-w-xl gap-3 scroll-mt-6">
         <CardHeader className="gap-1">
           <div className="flex items-center gap-2"><Phone className="size-4" aria-hidden="true" /><CardTitle className="text-sm font-medium">Call delivery and language</CardTitle></div>
           <p className="text-sm text-muted-foreground">Choose where Kordy calls you and how CALL-E speaks.</p>
@@ -143,6 +151,10 @@ export function AccountSettings() {
               <p id="default-phone-help" className="text-xs text-muted-foreground">Used when a trigger says “call me”. Include the country code.</p>
               <Input id="default-phone" name="defaultPhone" type="tel" inputMode="tel" autoComplete="tel" value={defaultPhone} onChange={(event) => setDefaultPhone(event.target.value)} placeholder="+919876543210" pattern="\+[1-9][0-9]{6,14}" aria-describedby="default-phone-help" className="h-11 text-base sm:text-sm" disabled={loading || saving} required />
             </div>
+            <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              {phoneVerifiedAt ? <BadgeCheck className="size-4 text-primary" aria-hidden="true" /> : <CircleAlert className="size-4" aria-hidden="true" />}
+              {phoneVerifiedAt ? "Verified for automatic calls" : "Unverified. Finish verification from Home before using automatic calls."}
+            </p>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <Label htmlFor="call-region">Calling region</Label>

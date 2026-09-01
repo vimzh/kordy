@@ -18,13 +18,27 @@ import { integrationConnections, notionConnections, users, vercelConnections } f
 test("enforces a per-user call budget without charging an idempotent retry twice", async () => {
   await initializeDatabase();
   const userId = `call-budget-${crypto.randomUUID()}`;
+  const sameEventUserId = `${userId}-same-event`;
+  const differentEventUserId = `${userId}-different-events`;
   await upsertUser({ sub: userId, email: `${userId}@example.com` });
+  await upsertUser({ sub: sameEventUserId, email: `${sameEventUserId}@example.com` });
+  await upsertUser({ sub: differentEventUserId, email: `${differentEventUserId}@example.com` });
   expect(await hasCallDispatchCapacity(userId, 1)).toBe(true);
   expect(await reserveCallDispatch(userId, "event-1", 1)).toBe(true);
   expect(await hasCallDispatchCapacity(userId, 1)).toBe(false);
   expect(await reserveCallDispatch(userId, "event-1", 1)).toBe(true);
   expect(await reserveCallDispatch(userId, "event-2", 1)).toBe(false);
+  expect(await Promise.all([
+    reserveCallDispatch(sameEventUserId, "event-1", 1),
+    reserveCallDispatch(sameEventUserId, "event-1", 1),
+  ])).toEqual([true, true]);
+  expect((await Promise.all([
+    reserveCallDispatch(differentEventUserId, "event-1", 1),
+    reserveCallDispatch(differentEventUserId, "event-2", 1),
+  ])).sort()).toEqual([false, true]);
   await db.delete(users).where(eq(users.id, userId));
+  await db.delete(users).where(eq(users.id, sameEventUserId));
+  await db.delete(users).where(eq(users.id, differentEventUserId));
 });
 
 test("does not poll paid providers when a connection has no active tasks", async () => {

@@ -300,7 +300,7 @@ Rules:
 - For Vercel, projectIds and projectNames must be copied from getVercelAccount. Empty project arrays mean all projects. environments may contain production, preview, both, or be empty for both.
 - For Notion, pageIds and pageTitles must be copied from getNotionWorkspace. Empty page arrays mean any shared page. A named page selects pageIds/pageTitles and is not a keyword. Add keywords only when the request explicitly describes content or a topic that must change; empty keywords mean any update.
 - For GitHub, Stripe, and n8n, eventNames are exact event names and keywords are case-insensitive substrings of the event summary. Empty arrays mean any event.
-- For Google Calendar, use eventNames ["event.starting"], keywords for optional title matching, and withinMinutes for how soon the event starts. Default to 15 minutes.
+- For Google Calendar, use eventNames ["event.starting"], keywords for optional title matching, and withinMinutes for how soon the event starts. Use at least 5 minutes; default to 15 minutes.
 - For weather, resolve an unambiguous named city to its city-centre latitude and longitude; otherwise ask for a more precise location. Default to 0.1 mm, 24 hours, and one consecutive hour only when the user gives no stronger threshold.
 - For SEC filings, CIK is the company's numeric SEC CIK and forms contains exact form names such as 8-K or 10-Q. Ask for clarification instead of guessing an ambiguous company.
 - For USGS earthquakes, use the requested centre coordinates, radius in kilometres, and minimum magnitude. Ask when the location is ambiguous.
@@ -427,6 +427,7 @@ export function validateTaskResult(value: unknown, context: TaskAgentContext): T
     }
   } else if (['github', 'stripe', 'google_calendar', 'n8n'].includes(parsed.data.trigger.source)) {
     if (!context.integration.connected || context.integration.provider !== parsed.data.trigger.source) throw new InvalidTaskResultError('A complete integration plan requires the selected connected source')
+    if (parsed.data.trigger.source === 'google_calendar' && parsed.data.trigger.rules.withinMinutes < 5) throw new InvalidTaskResultError('Google Calendar windows must be at least 5 minutes')
   }
 
   const { target } = parsed.data.action
