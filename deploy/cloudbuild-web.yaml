@@ -1,0 +1,12 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - deploy/Dockerfile.web
+      - --build-arg
+      - API_PROXY_TARGET=${_API_PROXY_TARGET}
+      - -t
+      - ${_IMAGE}
+      - .
+images: ["${_IMAGE}"]

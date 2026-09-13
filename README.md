@@ -2,6 +2,8 @@
 
 Minimal Bun monorepo with a Next.js + shadcn/ui frontend and Hono API.
 
+Live demo: https://kordy-web-mif2krwk2q-uc.a.run.app
+
 ## Development
 
 ```sh

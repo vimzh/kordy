@@ -3,11 +3,12 @@ import { AppSidebar } from "@/components/AppSidebar";
 import { CallsDashboard } from "@/components/calls/CallsDashboard";
 import type { CallMetrics, CallRecord } from "@/components/calls/types";
 import { SidebarProvider } from "@/components/ui/sidebar";
+import { serverApiUrl } from "@/lib/api";
 import { requireSession } from "@/lib/auth";
 
 export default async function CallsPage() {
   const user = await requireSession();
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
+  const apiUrl = serverApiUrl();
   const cookie = (await headers()).get("cookie") ?? "";
   const [callsResponse, metricsResponse] = await Promise.all([
     fetch(`${apiUrl}/calls?limit=25`, { cache: "no-store", headers: { Cookie: cookie } }),

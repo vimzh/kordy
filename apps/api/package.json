@@ -10,7 +10,7 @@
     "db:generate": "drizzle-kit generate",
     "db:push": "drizzle-kit push",
     "db:studio": "drizzle-kit studio",
-    "build": "bun build src/index.ts src/worker.ts --target bun --outdir dist",
+    "build": "bun build src/index.ts src/worker.ts src/worker-service.ts --target bun --outdir dist",
     "start": "bun run dist/index.js",
     "test": "bun test",
     "typecheck": "tsc --noEmit"

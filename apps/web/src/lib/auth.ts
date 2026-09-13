@@ -1,9 +1,10 @@
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
+import { serverApiUrl } from "@/lib/api";
 
 export async function getSession() {
   const response = await fetch(
-    `${process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007"}/auth/me`,
+    `${serverApiUrl()}/auth/me`,
     {
       headers: { cookie: (await headers()).get("cookie") ?? "" },
       cache: "no-store",

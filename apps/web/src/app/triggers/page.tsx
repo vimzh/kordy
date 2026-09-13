@@ -3,12 +3,12 @@ import { AppSidebar } from "@/components/AppSidebar";
 import type { Contact } from "@/components/ContactsTable";
 import { TriggersOverview } from "@/components/TriggersOverview";
 import { SidebarProvider } from "@/components/ui/sidebar";
+import { serverApiUrl } from "@/lib/api";
 import { requireSession } from "@/lib/auth";
 
 export default async function TriggersPage() {
   const user = await requireSession();
-  const apiUrl = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3007";
-  const response = await fetch(`${apiUrl}/contacts`, {
+  const response = await fetch(`${serverApiUrl()}/contacts`, {
     cache: "no-store",
     headers: { Cookie: (await headers()).get("cookie") ?? "" },
   });

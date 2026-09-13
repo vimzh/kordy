@@ -9,7 +9,9 @@
 </p>
 
 <!-- README-HACK:NEEDS-OWNER key="demo-video" instruction="Add the final public demo video URL here before submission." -->
-<!-- README-HACK:NEEDS-OWNER key="live-demo" instruction="Add the deployed public app URL here when available." -->
+<p align="center">
+  <a href="https://kordy-web-mif2krwk2q-uc.a.run.app">Open the live demo</a>
+</p>
 
 ## Why Kordy
 
