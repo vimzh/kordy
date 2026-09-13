@@ -325,8 +325,9 @@ export function decodePubSubPayload(payload: unknown) {
       : "message_id" in message && typeof message.message_id === "string" ? message.message_id : "";
     const data = JSON.parse(decodePubSubData(message.data)) as unknown;
     if (!messageId || !data || typeof data !== "object" || !("emailAddress" in data) || !("historyId" in data)
-      || typeof data.emailAddress !== "string" || !data.emailAddress || typeof data.historyId !== "string" || !data.historyId) throw new Error();
-    return { messageId, emailAddress: data.emailAddress, historyId: data.historyId };
+      || typeof data.emailAddress !== "string" || !data.emailAddress
+      || (typeof data.historyId !== "string" && typeof data.historyId !== "number") || !data.historyId) throw new Error();
+    return { messageId, emailAddress: data.emailAddress, historyId: String(data.historyId) };
   } catch {
     throw new Error("Invalid Pub/Sub payload");
   }

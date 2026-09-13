@@ -40,6 +40,9 @@ test("rejects malformed Pub/Sub payloads", () => {
   expect(decodePubSubPayload({
     message: { data: Buffer.from(JSON.stringify({ emailAddress: "me@example.com", historyId: "42" })).toString("base64"), messageId: "pub-1" },
   })).toEqual({ messageId: "pub-1", emailAddress: "me@example.com", historyId: "42" });
+  expect(decodePubSubPayload({
+    message: { data: Buffer.from(JSON.stringify({ emailAddress: "me@example.com", historyId: 43 })).toString("base64"), messageId: "pub-2" },
+  })).toEqual({ messageId: "pub-2", emailAddress: "me@example.com", historyId: "43" });
 });
 
 test("recursively reads plain text while ignoring attachments and enforcing the byte cap", () => {

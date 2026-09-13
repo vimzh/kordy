@@ -1,19 +1,27 @@
-// Google OAuth authorization-code flow and signed cookie sessions.
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+// Demo credential authentication and signed cookie sessions.
+import { createHmac, timingSafeEqual } from "node:crypto";
 import type { Context } from "hono";
 import { upsertUser } from "./db";
 
-const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
-const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
-const GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo";
+const DEMO_USER = { sub: "demo-user", email: "demo@gmail.com", name: "Demo User" } as const;
+const DEMO_PASSWORD = "demo1234";
 export type Session = { sub: string; email?: string; name?: string; picture?: string; exp: number };
-const env = () => ({ clientId: process.env.GOOGLE_CLIENT_ID, clientSecret: process.env.GOOGLE_CLIENT_SECRET, redirectUri: process.env.GOOGLE_REDIRECT_URI ?? "http://localhost:3007/auth/google/callback", sessionSecret: process.env.SESSION_SECRET, webUrl: process.env.WEB_URL ?? "http://localhost:3006/home" });
+const env = () => ({ sessionSecret: process.env.SESSION_SECRET });
 export const cookieValue = (cookie: string | undefined, name: string) => cookie?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${name}=`))?.slice(name.length + 1);
 const encode = (value: string) => Buffer.from(value).toString("base64url");
 const decode = (value: string) => Buffer.from(value, "base64url").toString("utf8");
 const sign = (value: string, secret: string) => createHmac("sha256", secret).update(value).digest("base64url");
 export const sessionCookie = (name: string, value: string, maxAge: number) => `${name}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${process.env.NODE_ENV === "production" ? "; Secure" : ""}`;
-const required = (values: Record<string, string | undefined>) => { const missing = Object.entries(values).filter(([, value]) => !value).map(([key]) => key); if (missing.length) throw new Error(`Missing OAuth configuration: ${missing.join(", ")}`); };
+
+function equalCredential(left: string, right: string) {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+export function demoCredentialsMatch(email: string, password: string) {
+  return equalCredential(email.toLowerCase(), DEMO_USER.email) && equalCredential(password, DEMO_PASSWORD);
+}
 
 export function validReturnTo(value: string | undefined) {
   if (!value || value.length > 500 || !value.startsWith("/") || value.startsWith("//") || value.includes("\\") || /[\u0000-\u001f\u007f]/.test(value)) return null;
@@ -34,27 +42,18 @@ export function setOAuthReturnTo(c: Context, cookieName: string, value: string |
   c.header("Set-Cookie", sessionCookie(cookieName, encodeURIComponent(validReturnTo(value) ?? ""), 600), { append: true });
 }
 
-export function startGoogleAuth(c: Context) {
-  const config = env(); required({ GOOGLE_CLIENT_ID: config.clientId, SESSION_SECRET: config.sessionSecret });
-  const state = randomBytes(24).toString("base64url");
-  const url = new URL(GOOGLE_AUTH_URL); url.search = new URLSearchParams({ client_id: config.clientId!, redirect_uri: config.redirectUri, response_type: "code", scope: "openid email profile", state }).toString();
-  c.header("Set-Cookie", sessionCookie("oauth_state", state, 600)); return c.redirect(url.toString());
-}
-
-export async function finishGoogleAuth(c: Context) {
-  const config = env(); required({ GOOGLE_CLIENT_ID: config.clientId, GOOGLE_CLIENT_SECRET: config.clientSecret, SESSION_SECRET: config.sessionSecret });
-  const queryState = c.req.query("state"); const savedState = cookieValue(c.req.header("Cookie"), "oauth_state");
-  if (!queryState || !savedState || queryState !== savedState) return c.text("Invalid OAuth state", 400);
-  const code = c.req.query("code"); if (!code) return c.text("Missing OAuth code", 400);
-  const tokenResponse = await fetch(GOOGLE_TOKEN_URL, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: config.clientId!, client_secret: config.clientSecret!, redirect_uri: config.redirectUri, grant_type: "authorization_code" }) });
-  if (!tokenResponse.ok) return c.text(`Google token exchange failed: ${await tokenResponse.text()}`, 502);
-  const token = (await tokenResponse.json()) as { access_token?: string }; if (!token.access_token) return c.text("Google did not return an access token", 502);
-  const userResponse = await fetch(GOOGLE_USERINFO_URL, { headers: { Authorization: `Bearer ${token.access_token}` } });
-  if (!userResponse.ok) return c.text(`Google profile lookup failed: ${await userResponse.text()}`, 502);
-  const user = (await userResponse.json()) as { sub?: string; email?: string; name?: string; picture?: string }; if (!user.sub) return c.text("Google profile did not include a subject", 502);
-  await upsertUser({ sub: user.sub, email: user.email, name: user.name, picture: user.picture });
-  const payload = encode(JSON.stringify({ sub: user.sub, email: user.email, name: user.name, picture: user.picture, exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7 } satisfies Session));
-  c.header("Set-Cookie", sessionCookie("kyub_session", `${payload}.${sign(payload, config.sessionSecret!)}`, 60 * 60 * 24 * 7)); return c.redirect(config.webUrl);
+export async function loginWithDemoCredentials(c: Context) {
+  const body = await c.req.json().catch(() => null) as { email?: unknown; password?: unknown } | null;
+  if (typeof body?.email !== "string" || typeof body.password !== "string" || !demoCredentialsMatch(body.email.trim(), body.password)) {
+    return c.json({ error: "Invalid email or password" }, 401);
+  }
+  const secret = env().sessionSecret;
+  if (!secret) throw new Error("Missing SESSION_SECRET");
+  await upsertUser(DEMO_USER);
+  const maxAge = 60 * 60 * 24 * 7;
+  const payload = encode(JSON.stringify({ ...DEMO_USER, exp: Math.floor(Date.now() / 1000) + maxAge } satisfies Session));
+  c.header("Set-Cookie", sessionCookie("kyub_session", `${payload}.${sign(payload, secret)}`, maxAge));
+  return c.json({ user: DEMO_USER });
 }
 
 export function currentSession(c: Context) {

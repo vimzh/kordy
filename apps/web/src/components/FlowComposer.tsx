@@ -153,7 +153,6 @@ type NotionConnection = { id: string; name: string; status: "connected" | "needs
 type IntegrationConnection = { id: string; provider: "github" | "stripe" | "google_calendar" | "n8n"; label: string; status: "connected" | "needs_reconnect" | "disconnected" };
 type ExecutionMode = "approval" | "automatic";
 type FlowDraft = {
-  name: string;
   value: string;
   selectedSources: string[];
   selectedGmailConnectionId: string;
@@ -270,7 +269,6 @@ export function FlowComposer({
   contacts: Contact[];
   onCreated?: (task: Task) => void;
 }) {
-  const [name, setName] = useState("");
   const [value, setValue] = useState("");
   const [focused, setFocused] = useState(false);
   const [selectedSources, setSelectedSources] = useState<string[]>([]);
@@ -324,7 +322,6 @@ export function FlowComposer({
     const frame = window.requestAnimationFrame(() => {
       setValue(draftValue);
       inputRef.current?.replaceChildren(draftValue);
-      setName(draft.name ?? "");
       setSelectedSources(draftSources.filter((source): source is string => typeof source === "string"));
       setSelectedGmailConnectionId(draft.selectedGmailConnectionId ?? "");
       setSelectedVercelConnectionId(draft.selectedVercelConnectionId ?? "");
@@ -341,9 +338,8 @@ export function FlowComposer({
   }, []);
 
   useEffect(() => {
-    if (!restoredDraft.current && !name && !value && !selectedSources.length) return;
+    if (!restoredDraft.current && !value && !selectedSources.length) return;
     const draft: FlowDraft = {
-      name,
       value,
       selectedSources,
       selectedGmailConnectionId,
@@ -353,7 +349,7 @@ export function FlowComposer({
       executionMode,
     };
     localStorage.setItem(draftKey, JSON.stringify(draft));
-  }, [executionMode, name, selectedGmailConnectionId, selectedIntegrationConnectionId, selectedNotionConnectionId, selectedSources, selectedVercelConnectionId, value]);
+  }, [executionMode, selectedGmailConnectionId, selectedIntegrationConnectionId, selectedNotionConnectionId, selectedSources, selectedVercelConnectionId, value]);
 
   useEffect(() => {
     let active = true;
@@ -442,7 +438,6 @@ export function FlowComposer({
 
   function saveDraft() {
     const draft: FlowDraft = {
-      name,
       value,
       selectedSources,
       selectedGmailConnectionId,
@@ -455,7 +450,6 @@ export function FlowComposer({
   }
 
   function resetComposer() {
-    setName("");
     setValue("");
     inputRef.current?.replaceChildren();
     setSelectedSources([]);
@@ -602,7 +596,7 @@ export function FlowComposer({
     try {
       const requestKey = clarification
         ? `clarify:${clarification.taskId}:${answer}`
-        : `create:${name}:${prompt}:${selectedSources.join(",")}:${selectedGmailConnectionId}:${selectedVercelConnectionId}:${selectedNotionConnectionId}:${selectedIntegrationConnectionId}:${executionMode}`;
+        : `create:${prompt}:${selectedSources.join(",")}:${selectedGmailConnectionId}:${selectedVercelConnectionId}:${selectedNotionConnectionId}:${selectedIntegrationConnectionId}:${executionMode}`;
       const requestId = requestIds.current.get(requestKey) ?? crypto.randomUUID();
       requestIds.current.set(requestKey, requestId);
       const response = await fetch(
@@ -616,7 +610,6 @@ export function FlowComposer({
               ? { requestId, answer }
               : {
                 requestId,
-                name: name.trim() || undefined,
                 prompt,
                 selectedSources,
                 executionMode,
@@ -704,19 +697,6 @@ export function FlowComposer({
 
   return (
     <form onSubmit={submit} className="relative w-full rounded-xl border bg-card p-3 shadow-xs">
-      {!clarification ? (
-        <label className="mb-2 block px-2 text-sm">
-          <span className="sr-only">Trigger name</span>
-          <Input
-            name="trigger-name"
-            value={name}
-            maxLength={120}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="Trigger name (optional)"
-            className="border-0 bg-muted/45 shadow-none focus-visible:bg-background"
-          />
-        </label>
-      ) : null}
       {clarification ? (
         <div className="space-y-3 px-2 py-1">
           <div>

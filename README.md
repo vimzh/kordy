@@ -15,7 +15,7 @@ bun run dev
 - Health: http://localhost:3007/health
 - PostgreSQL: localhost:5435
 
-Register `http://localhost:3007/auth/google/callback`, `http://localhost:3007/connections/gmail/callback`, and `http://localhost:3007/connections/google-calendar/callback` as authorized redirect URIs in the Google OAuth client.
+Register `http://localhost:3007/connections/gmail/callback` and `http://localhost:3007/connections/google-calendar/callback` as authorized redirect URIs in the Google OAuth client.
 
 GitHub and n8n connections generate a webhook URL and one-time secret in the Connections page. Stripe uses the same flow but requires the endpoint `whsec_` secret that Stripe generates.
 

@@ -153,7 +153,7 @@ export function AccountSettings() {
             </div>
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               {phoneVerifiedAt ? <BadgeCheck className="size-4 text-primary" aria-hidden="true" /> : <CircleAlert className="size-4" aria-hidden="true" />}
-              {phoneVerifiedAt ? "Verified for automatic calls" : "Unverified. Finish verification from Home before using automatic calls."}
+              {phoneVerifiedAt ? "Verified for automatic calls" : "Unverified. Use Invoke call on Home to verify this number."}
             </p>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">

@@ -4,11 +4,9 @@
 import {
   Dialog,
   DialogContent,
-  DialogHeader,
-  DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Button } from "@/components/ui/button";
+import { DemoLoginForm } from "@/components/DemoLoginForm";
 
 export function GetStartedDialog({
   buttonBgColor,
@@ -20,7 +18,7 @@ export function GetStartedDialog({
   isAuthenticated?: boolean;
 }) {
   const buttonClassName =
-    "card-nav-cta-button hidden md:inline-flex border-0 rounded-[calc(0.75rem-0.2rem)] px-4 items-center h-full font-medium cursor-pointer transition-colors duration-300";
+    "card-nav-cta-button inline-flex border-0 rounded-[calc(0.75rem-0.2rem)] px-3 md:px-4 items-center h-full font-medium cursor-pointer transition-colors duration-300";
 
   if (isAuthenticated) {
     return (
@@ -39,7 +37,7 @@ export function GetStartedDialog({
       <DialogTrigger asChild>
         <button
           type="button"
-          className="card-nav-cta-button hidden md:inline-flex border-0 rounded-[calc(0.75rem-0.2rem)] px-4 items-center h-full font-medium cursor-pointer transition-colors duration-300"
+          className={buttonClassName}
           style={{ backgroundColor: buttonBgColor, color: buttonTextColor }}
         >
           Get Started
@@ -47,17 +45,7 @@ export function GetStartedDialog({
       </DialogTrigger>
 
       <DialogContent className="max-w-sm p-0" style={{ fontFamily: "var(--font-kordy)" }}>
-        <DialogHeader className="p-6 pr-12">
-          <div className="flex items-center gap-3">
-            <img src="/kyub-logo.png" alt="" className="size-9 rounded-lg" />
-            <DialogTitle className="text-xl tracking-[-0.04em]">Hey, I&apos;m Kordy.</DialogTitle>
-          </div>
-        </DialogHeader>
-        <div className="p-6 pt-0">
-          <Button asChild size="lg" className="w-full">
-            <a href="/login">Continue with Google</a>
-          </Button>
-        </div>
+        <DemoLoginForm />
       </DialogContent>
     </Dialog>
   );

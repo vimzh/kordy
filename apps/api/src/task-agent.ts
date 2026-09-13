@@ -296,7 +296,7 @@ Rules:
 - Every non-empty rule category is required. Keywords and labels within a category are ANDed. Multiple senders are an allow-list: one exact sender must match.
 - senders contain normalized, exact email addresses only. Never place names there.
 - subjectKeywords and bodyKeywords are case-insensitive literal substrings, not regexes. Put "about X" in subjectKeywords unless the user explicitly says body/content/message text.
-- labels must be copied exactly from the Gmail labels returned by getGmailAccount. Empty arrays mean that category is unconstrained.
+- labels must be copied exactly from the Gmail labels returned by getGmailAccount. Empty arrays mean that category is unconstrained. Do not copy every available label when the user did not request a label filter.
 - For Vercel, projectIds and projectNames must be copied from getVercelAccount. Empty project arrays mean all projects. environments may contain production, preview, both, or be empty for both.
 - For Notion, pageIds and pageTitles must be copied from getNotionWorkspace. Empty page arrays mean any shared page. A named page selects pageIds/pageTitles and is not a keyword. Add keywords only when the request explicitly describes content or a topic that must change; empty keywords mean any update.
 - For GitHub, Stripe, and n8n, eventNames are exact event names and keywords are case-insensitive substrings of the event summary. Empty arrays mean any event.
@@ -446,12 +446,16 @@ export function validateTaskResult(value: unknown, context: TaskAgentContext): T
 
 export function taskTriggerFromResult(result: Extract<TaskParseResult, { status: 'complete' }>, context: TaskAgentContext): TaskTrigger {
   const { trigger } = result
-  if (trigger.source === 'gmail') return {
-    type: 'email.received', match: 'and',
-    senders: trigger.rules.senders.map(value => value.toLowerCase()),
-    subjectKeywords: trigger.rules.subjectKeywords,
-    bodyKeywords: trigger.rules.bodyKeywords,
-    labels: trigger.rules.labels.map(name => context.gmail.labelIds[name]!),
+  if (trigger.source === 'gmail') {
+    const selectedEveryLabel = context.gmail.labels.length > 0
+      && context.gmail.labels.every(label => trigger.rules.labels.includes(label))
+    return {
+      type: 'email.received', match: 'and',
+      senders: trigger.rules.senders.map(value => value.toLowerCase()),
+      subjectKeywords: trigger.rules.subjectKeywords,
+      bodyKeywords: trigger.rules.bodyKeywords,
+      labels: selectedEveryLabel ? [] : trigger.rules.labels.map(name => context.gmail.labelIds[name]!),
+    }
   }
   if (trigger.source === 'vercel') return { type: 'deployment.failed', ...trigger.rules }
   if (trigger.source === 'notion') return { type: 'notion.page.updated', ...trigger.rules }

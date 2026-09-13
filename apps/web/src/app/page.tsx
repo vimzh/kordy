@@ -1,5 +1,4 @@
 import { cookies } from "next/headers";
-import { AnnouncementBar } from "@/components/AnnouncementBar";
 import CardNav, { type CardNavItem } from "@/components/CardNav";
 import { FaqSection } from "@/components/FaqSection";
 import { Hero } from "@/components/Hero";
@@ -45,9 +44,7 @@ export default async function Home() {
 
   return (
     <main className="relative min-h-screen overflow-hidden">
-      <AnnouncementBar />
       <CardNav
-        className="!top-[3.45rem] md:!top-[4.25rem]"
         logo="/kyub-logo.png"
         logoAlt="Kordy"
         items={navItems}
