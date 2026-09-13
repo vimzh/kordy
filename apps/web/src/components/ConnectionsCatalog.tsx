@@ -30,9 +30,10 @@ import { WebhookConnectionDialog } from "@/components/WebhookConnectionDialog";
 
 const connections = [
   { name: "Gmail", description: "Read and send email through your Google account.", icon: SiGmail },
-  { name: "Vercel", description: "Access projects, deployments, and build activity.", icon: SiVercel },
-  { name: "Slack", description: "Work with channels, messages, and team activity.", icon: MessageSquare },
+  { name: "Slack", description: "Work with channels, messages, and team activity.", icon: MessageSquare, showUnavailableAction: false },
+  { name: "Stripe", description: "Watch payment, subscription, and dispute events.", icon: SiStripe },
   { name: "GitHub", description: "Watch repository, issue, pull request, and workflow events.", icon: SiGithub },
+  { name: "Vercel", description: "Access projects, deployments, and build activity.", icon: SiVercel },
   { name: "Notion", description: "Search and update pages, databases, and workspace content.", icon: SiNotion },
   { name: "Google Drive", description: "Find and manage files across Google Drive.", icon: SiGoogledrive },
   { name: "Google Calendar", description: "Watch upcoming events in your primary calendar.", icon: SiGooglecalendar },
@@ -43,7 +44,6 @@ const connections = [
   { name: "Trello", description: "Read and update boards, lists, and cards.", icon: SiTrello },
   { name: "Discord", description: "Connect server channels and community messages.", icon: SiDiscord },
   { name: "Zoom", description: "Access meetings, recordings, and call details.", icon: SiZoom },
-  { name: "Stripe", description: "Watch payment, subscription, and dispute events.", icon: SiStripe },
   { name: "n8n", description: "Receive events from your existing n8n workflows.", icon: Workflow },
   { name: "Shopify", description: "Connect products, orders, and store operations.", icon: SiShopify },
   { name: "Airtable", description: "Read and update records in Airtable bases.", icon: SiAirtable },

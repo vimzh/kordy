@@ -1,0 +1,19 @@
+FROM oven/bun:1.4.0 AS build
+WORKDIR /app
+
+COPY package.json bun.lock ./
+COPY apps/api/package.json apps/api/package.json
+COPY apps/web/package.json apps/web/package.json
+RUN bun install --frozen-lockfile
+
+COPY apps/web apps/web
+ARG API_PROXY_TARGET
+ENV API_PROXY_TARGET=${API_PROXY_TARGET}
+ENV NEXT_PUBLIC_API_URL=/api
+RUN bun run --cwd apps/web build
+
+FROM oven/bun:1.4.0
+WORKDIR /app
+COPY --from=build /app ./
+ENV NODE_ENV=production PORT=8080 NEXT_PUBLIC_API_URL=/api
+CMD ["sh", "-c", "bun run --cwd apps/web start -p ${PORT}"]

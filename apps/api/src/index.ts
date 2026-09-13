@@ -2,7 +2,7 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { clearSession, cookieValue, currentSession, finishGoogleAuth, oauthReturnTo, sessionCookie, setOAuthReturnTo, startGoogleAuth, type Session } from "./auth";
+import { clearSession, cookieValue, currentSession, loginWithDemoCredentials, oauthReturnTo, sessionCookie, setOAuthReturnTo, type Session } from "./auth";
 import {
   answeredBy, CalleApiError, calleSources, confirmedPhoneOwnership, confirmedReplyInstruction, getCalleCall,
   normalizeCallLocale, normalizeCallRegion, normalizePhone, type CalleSource,
@@ -282,8 +282,7 @@ function callErrorResponse(c: Parameters<typeof currentSession>[0], error: unkno
 
 app.get("/", (c) => c.text("Kordy API"));
 app.get("/health", (c) => c.json({ status: "ok" }));
-app.get("/auth/google", startGoogleAuth);
-app.get("/auth/google/callback", finishGoogleAuth);
+app.post("/auth/login", loginWithDemoCredentials);
 app.get("/auth/me", async (c) => c.json({ user: await user(c) }));
 app.post("/auth/logout", clearSession);
 

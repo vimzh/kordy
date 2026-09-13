@@ -5,6 +5,7 @@ import { useEffect, useState } from "react";
 import { BadgeCheck, CircleAlert, Phone } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
@@ -13,6 +14,7 @@ type Profile = {
   defaultPhone: string | null;
   callRegion: string | null;
   callLocale: string | null;
+  outboundCallConsentAt?: string | null;
   phoneVerifiedAt?: string | null;
 };
 type RegionOption = { value: string; label: string; locales: Array<{ value: string; label: string }> };
@@ -72,6 +74,7 @@ export function AccountSettings() {
   const [defaultPhone, setDefaultPhone] = useState("");
   const [callRegion, setCallRegion] = useState(automatic);
   const [callLocale, setCallLocale] = useState(automatic);
+  const [outboundCallConsent, setOutboundCallConsent] = useState(false);
   const [phoneVerifiedAt, setPhoneVerifiedAt] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -89,6 +92,7 @@ export function AccountSettings() {
           setDefaultPhone(result.profile.defaultPhone ?? "");
           setCallRegion(result.profile.callRegion ?? automatic);
           setCallLocale(result.profile.callLocale ?? automatic);
+          setOutboundCallConsent(Boolean(result.profile.outboundCallConsentAt));
           setPhoneVerifiedAt(result.profile.phoneVerifiedAt ?? null);
         }
       })
@@ -121,6 +125,14 @@ export function AccountSettings() {
       });
       const result = await response.json().catch(() => null) as { profile?: Profile; error?: string } | null;
       if (!response.ok || !result?.profile) throw new Error(result?.error ?? "Could not save call preferences");
+      const consentResponse = await fetch(`${apiUrl}/onboarding/consent`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ consent: outboundCallConsent }),
+      });
+      const consentResult = await consentResponse.json().catch(() => null) as { error?: string } | null;
+      if (!consentResponse.ok) throw new Error(consentResult?.error ?? "Could not save outbound call consent");
       setDefaultPhone(result.profile.defaultPhone ?? "");
       setCallRegion(result.profile.callRegion ?? automatic);
       setCallLocale(result.profile.callLocale ?? automatic);
@@ -153,7 +165,7 @@ export function AccountSettings() {
             </div>
             <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
               {phoneVerifiedAt ? <BadgeCheck className="size-4 text-primary" aria-hidden="true" /> : <CircleAlert className="size-4" aria-hidden="true" />}
-              {phoneVerifiedAt ? "Verified for automatic calls" : "Unverified. Finish verification from Home before using automatic calls."}
+              {phoneVerifiedAt ? "Verified for automatic calls" : "Unverified. Use Invoke call on Home to verify this number."}
             </p>
             <div className="grid gap-4 sm:grid-cols-2">
               <div className="space-y-1.5">
@@ -178,6 +190,10 @@ export function AccountSettings() {
               </div>
             </div>
             {callRegion === "IN" ? <p className="text-xs text-muted-foreground">CALL-E currently routes India calls through international testing lines. A local production line requires CALL-E enablement.</p> : null}
+            <div className="flex items-start gap-2.5">
+              <Checkbox id="outbound-call-consent" checked={outboundCallConsent} onCheckedChange={(checked) => setOutboundCallConsent(checked === true)} disabled={loading || saving} />
+              <Label htmlFor="outbound-call-consent" className="font-normal leading-5">I authorize Kordy to place verification and workflow calls I request.</Label>
+            </div>
             <Button type="submit" className="h-11" disabled={loading || saving}>{saving ? "Saving…" : "Save call preferences"}</Button>
           </form>
           {message ? <p role="status" aria-live="polite" className={`mt-3 text-sm ${message === "Saved." ? "text-muted-foreground" : "text-destructive"}`}>{message}</p> : null}

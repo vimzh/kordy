@@ -13,6 +13,7 @@ type ConnectionCardProps = {
   connectHref?: string;
   onConnect?: () => void;
   onDisconnect?: () => void;
+  showUnavailableAction?: boolean;
 };
 
 export function ConnectionCard({
@@ -25,6 +26,7 @@ export function ConnectionCard({
   connectHref,
   onConnect,
   onDisconnect,
+  showUnavailableAction = true,
 }: ConnectionCardProps) {
   return (
     <Card
@@ -66,9 +68,9 @@ export function ConnectionCard({
               <Button type="button" variant="ghost" disabled={busy} onClick={onConnect}>
                 {status === "needs_reconnect" ? "Reconnect" : "Connect"}
               </Button>
-            ) : (
+            ) : showUnavailableAction ? (
               <Button type="button" variant="ghost" disabled>Coming soon</Button>
-            )}
+            ) : null}
           </div>
         </div>
       </CardContent>

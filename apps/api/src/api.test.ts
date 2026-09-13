@@ -2,7 +2,7 @@ import { afterAll, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { eq } from "drizzle-orm";
 import server from "./index";
-import { validReturnTo } from "./auth";
+import { demoCredentialsMatch, validReturnTo } from "./auth";
 import { createTask, db, saveCallTask, upsertUser } from "./db";
 import { callTasks, users } from "./schema";
 
@@ -30,6 +30,22 @@ test("accepts only short path-only OAuth return targets", () => {
   expect(validReturnTo("https://evil.example/path")).toBeNull();
   expect(validReturnTo("//evil.example/path")).toBeNull();
   expect(validReturnTo("/\\evil.example/path")).toBeNull();
+});
+
+test("accepts only the published demo credentials", () => {
+  expect(demoCredentialsMatch("demo@gmail.com", "demo1234")).toBe(true);
+  expect(demoCredentialsMatch("DEMO@gmail.com", "demo1234")).toBe(true);
+  expect(demoCredentialsMatch("demo@gmail.com", "wrong-password")).toBe(false);
+});
+
+test("rejects invalid demo login attempts", async () => {
+  const response = await server.fetch(new Request("http://localhost/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "demo@gmail.com", password: "wrong-password" }),
+  }));
+  expect(response.status).toBe(401);
+  expect(await response.json()).toEqual({ error: "Invalid email or password" });
 });
 
 test("requires Gmail before parsing a task and keeps the public response shape", async () => {

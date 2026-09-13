@@ -144,6 +144,10 @@ test("a Gmail message can create only one task run even when its notification is
   const reconciliationClaims = await Promise.all([claimStaleCallForReconciliation(), claimStaleCallForReconciliation()]);
   expect(reconciliationClaims.filter((claim) => claim?.id === reconcileCallId)).toHaveLength(1);
   expect(reconciliationClaims.find((claim) => claim?.id === reconcileCallId)).toMatchObject({ userId, phone: "+12025550123", source: "gmail", attempts: 1 });
+  const directCallId = `pipeline-direct-${crypto.randomUUID()}`;
+  await saveCallTask({ id: directCallId, userId, task: "Verify the saved phone", phone: "+12025550123", source: "verification", status: "queued" });
+  await db.update(callTasks).set({ updatedAt: "2000-01-01T00:00:00.000Z", reconcileAvailableAt: "2000-01-01T00:00:00.000Z" }).where(eq(callTasks.id, directCallId));
+  expect(await claimStaleCallForReconciliation()).toMatchObject({ id: directCallId, source: "verification", attempts: 1 });
   await updateCallTask({ id: reconcileCallId, status: "completed", summary: "Done" });
   await updateCallTask({ id: reconcileCallId, status: "calling", summary: "Late stale response" });
   expect((await db.select({ status: callTasks.status, summary: callTasks.summary }).from(callTasks).where(eq(callTasks.id, reconcileCallId)))[0]).toEqual({ status: "completed", summary: "Done" });

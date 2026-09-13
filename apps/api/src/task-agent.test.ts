@@ -58,6 +58,15 @@ describe('task plan validation', () => {
     expect(validateTaskResult(complete, context)).toEqual(complete)
   })
 
+  test('treats every available Gmail label as no label restriction', () => {
+    const allLabels = {
+      ...complete,
+      trigger: { ...complete.trigger, rules: { ...complete.trigger.rules, labels: context.gmail.labels } },
+    }
+    expect(taskTriggerFromResult(allLabels, context)).toMatchObject({ labels: [] })
+    expect(taskTriggerFromResult(complete, context)).toMatchObject({ labels: ['IMPORTANT'] })
+  })
+
   test('accepts a connected Vercel deployment failure plan', () => {
     const vercelPlan = {
       status: 'complete' as const,

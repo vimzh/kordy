@@ -220,8 +220,17 @@ export type CallTask = {
 };
 
 const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl) throw new Error("Missing DATABASE_URL");
-const client = new SQL({ url: databaseUrl, max: 2 });
+const databaseSocket = process.env.DATABASE_SOCKET;
+if (!databaseUrl && !databaseSocket) throw new Error("Missing DATABASE_URL or DATABASE_SOCKET");
+const client = databaseSocket
+  ? new SQL({
+      path: databaseSocket,
+      database: process.env.DATABASE_NAME,
+      username: process.env.DATABASE_USER,
+      password: process.env.DATABASE_PASSWORD,
+      max: 2,
+    })
+  : new SQL({ url: databaseUrl!, max: 2 });
 export const db = drizzle({ client });
 
 export async function initializeDatabase() {
@@ -1914,10 +1923,11 @@ export async function retryEmailReply(userId: string, callId: string) {
 export async function claimStaleCallForReconciliation() {
   const rows = await db.execute<{ id: string; attempts: number; userId: string; phone: string; source: string }>(sql`
     with next as (
-      select c.id from call_tasks c join task_runs r on r.id = c.task_run_id
-      where r.status = 'calling' and c.status not in ('completed', 'failed', 'canceled')
+      select c.id from call_tasks c
+      where (c.task_run_id is null or exists (select 1 from task_runs r where r.id = c.task_run_id and r.status = 'calling'))
+        and c.status not in ('completed', 'failed', 'canceled')
         and c.updated_at < now() - interval '10 minutes' and c.reconcile_available_at <= now()
-      order by c.reconcile_available_at, c.created_at for update of c skip locked limit 1
+      order by c.reconcile_available_at, c.created_at for update skip locked limit 1
     )
     update call_tasks c set reconciliation_attempts = c.reconciliation_attempts + 1,
       reconcile_available_at = null, updated_at = now()

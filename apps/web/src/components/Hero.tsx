@@ -1,5 +1,4 @@
 import type { CSSProperties } from "react";
-
 import { RotatingCallText } from "@/components/RotatingCallText";
 import AIOrbFace from "@/components/smoothui/ai-orb-face";
 import SmoothButton from "@/components/smoothui/smooth-button";
